@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
+import { getFailureDisplay } from "../api/failure";
 import { ApiError } from "../api/errors";
 import type { Analysis, Note, Review } from "../api/types";
 import AnalysisReview from "../components/AnalysisReview";
@@ -84,7 +85,17 @@ export default function NoteDetailPage() {
         signal: controller.signal,
         onStatus: (event) => setStage(event.stage),
         onComplete: (event) => setAnalysis(event.analysis),
-        onError: (message) => setError(message),
+        onError: async ({ reason }) => {
+          const detail = await api.getNote(noteId).catch(() => null);
+          if (detail) {
+            setNote(detail.note);
+            setAnalysis(detail.analysis);
+            setReview(detail.review);
+            setError(null);
+          } else {
+            setError(getFailureDisplay(reason).message);
+          }
+        },
       });
     } catch (err) {
       setError(

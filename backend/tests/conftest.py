@@ -190,7 +190,7 @@ def db() -> AsyncMock:
     mock.get_review_for_analysis = AsyncMock(return_value=None)
     mock.persist_analysis_for_note = AsyncMock()
     mock.create_analysis_job = AsyncMock()
-    mock.claim_analysis_job = AsyncMock(return_value="processing")
+    mock.claim_analysis_job = AsyncMock(return_value="claimed")
     mock.get_analysis_job = AsyncMock()
     mock.finish_analysis_job = AsyncMock()
     mock.upsert_review = AsyncMock()

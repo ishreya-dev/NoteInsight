@@ -8,6 +8,7 @@ import type {
   ReviewCreate,
   Review,
   NoteCreatePayload,
+  AnalysisFailureReason,
 } from "./types";
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL as string;
@@ -18,7 +19,10 @@ export type AnalysisStreamHandlers = {
   signal?: AbortSignal;
   onStatus: (status: import("./types").AnalysisStreamStatus) => void;
   onComplete: (result: import("./types").AnalysisStreamComplete) => void;
-  onError: (message: string) => void;
+  onError: (error: {
+    reason: AnalysisFailureReason;
+    message: string;
+  }) => void;
 };
 
 async function request<T>(
@@ -142,9 +146,28 @@ export const api = {
             handlers.onComplete(parsed as import("./types").AnalysisStreamComplete);
           } else if (event === "error") {
             handlers.onError(
-              typeof parsed === "object" && parsed !== null && "message" in parsed
-                ? String(parsed.message)
-                : "Analysis failed. Please try again.",
+              typeof parsed === "object" && parsed !== null
+                ? {
+                    reason:
+                      "reason" in parsed &&
+                      [
+                        "rate_limited",
+                        "invalid_output",
+                        "timeout",
+                        "provider_error",
+                        "unknown",
+                      ].includes(String(parsed.reason))
+                        ? (String(parsed.reason) as AnalysisFailureReason)
+                        : "unknown",
+                    message:
+                      "message" in parsed
+                        ? String(parsed.message)
+                        : "Analysis failed. Please try again.",
+                  }
+                : {
+                    reason: "unknown",
+                    message: "Analysis failed. Please try again.",
+                  },
             );
           }
         }

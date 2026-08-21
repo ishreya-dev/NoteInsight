@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
 
@@ -16,8 +17,9 @@ from pydantic import BaseModel, Field
 from app.config import Settings, get_settings
 from app.dependencies import get_current_user
 from app.models.analysis import Analysis, Review
-from app.models.note import Note, NoteCreate, NoteListItem, ReviewStatus
+from app.models.note import Note, NoteCreate, NoteListItem
 from app.models.user import AuthenticatedUser
+from app.services.analysis_jobs import _run_analysis_job
 from app.services.firestore_client import (
     DocumentConflictError,
     DocumentDataError,
@@ -25,9 +27,7 @@ from app.services.firestore_client import (
     get_firestore_client,
 )
 from app.services.gemini_client import (
-    GeminiAnalysisError,
     GeminiClient,
-    PROMPT_VERSION,
     get_gemini_client,
 )
 
@@ -66,8 +66,6 @@ async def create_note(
     payload: NoteCreate,
     current_user: AuthenticatedUser = Depends(get_current_user),
     db: FirestoreClient = Depends(get_firestore_client),
-    gemini: GeminiClient = Depends(get_gemini_client),
-    settings: Settings = Depends(get_settings),
 ) -> NoteCreateResponse:
     """Create a note and enqueue its analysis."""
     try:
@@ -198,8 +196,6 @@ async def reanalyze_note(
     note_id: str,
     current_user: AuthenticatedUser = Depends(get_current_user),
     db: FirestoreClient = Depends(get_firestore_client),
-    gemini: GeminiClient = Depends(get_gemini_client),
-    settings: Settings = Depends(get_settings),
 ) -> NoteCreateResponse:
     """Create a new analysis for an existing note; prior analyses are kept."""
     note = await _require_owned_note(
@@ -242,16 +238,52 @@ async def stream_analysis(
     job_id = note.analysis_job_id
 
     async def events() -> AsyncIterator[str]:
-        job = await db.get_analysis_job(job_id=job_id, user_id=current_user.uid)
+        stream_started_at = time.perf_counter()
+        poll_count = 0
+
+        def log_stream_completed() -> None:
+            logger.info(
+                "analysis_stream_completed note_id=%s job_id=%s "
+                "duration_ms=%d poll_count=%d",
+                note_id,
+                job_id,
+                round((time.perf_counter() - stream_started_at) * 1000),
+                poll_count,
+            )
+
+        try:
+            job = await db.get_analysis_job(
+                job_id=job_id,
+                user_id=current_user.uid,
+            )
+        except Exception:
+            logger.exception("Failed to load analysis job %s", job_id)
+            yield _sse(
+                "error",
+                {"message": "Analysis status could not be loaded."},
+            )
+            log_stream_completed()
+            return
         if job is None:
             yield _sse("error", {"message": "Analysis could not be found."})
+            log_stream_completed()
             return
 
         if job.get("status") == "pending":
-            claimed = await db.claim_analysis_job(
-                job_id=job_id, user_id=current_user.uid
-            )
-            if claimed == "processing":
+            try:
+                claimed = await db.claim_analysis_job(
+                    job_id=job_id,
+                    user_id=current_user.uid,
+                )
+            except Exception:
+                logger.exception("Failed to claim analysis job %s", job_id)
+                yield _sse(
+                    "error",
+                    {"message": "Analysis could not be started."},
+                )
+                log_stream_completed()
+                return
+            if claimed == "claimed":
                 asyncio.create_task(
                     _run_analysis_job(note, job_id, db, gemini, settings)
                 )
@@ -260,10 +292,25 @@ async def stream_analysis(
         last_status = None
         while True:
             if await request.is_disconnected():
+                log_stream_completed()
                 return
-            job = await db.get_analysis_job(job_id=job_id, user_id=current_user.uid)
+            poll_count += 1
+            try:
+                job = await db.get_analysis_job(
+                    job_id=job_id,
+                    user_id=current_user.uid,
+                )
+            except Exception:
+                logger.exception("Failed to poll analysis job %s", job_id)
+                yield _sse(
+                    "error",
+                    {"message": "Analysis status could not be loaded."},
+                )
+                log_stream_completed()
+                return
             if job is None:
                 yield _sse("error", {"message": "Analysis could not be found."})
+                log_stream_completed()
                 return
             current_status = job.get("status")
             if current_status != last_status:
@@ -271,17 +318,41 @@ async def stream_analysis(
                     yield _sse("status", {"stage": "analyzing_conditions", "message": "Analyzing conditions and documentation gaps..."})
                 last_status = current_status
             if current_status == "completed":
-                analysis = await db.get_analysis(
-                    analysis_id=job["analysis_id"], user_id=current_user.uid
-                )
+                try:
+                    analysis = await db.get_analysis(
+                        analysis_id=job["analysis_id"],
+                        user_id=current_user.uid,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to read completed analysis for job %s", job_id
+                    )
+                    yield _sse(
+                        "error",
+                        {"message": "Analysis could not be loaded."},
+                    )
+                    log_stream_completed()
+                    return
                 if analysis is None:
                     yield _sse("error", {"message": "Analysis could not be loaded."})
+                    log_stream_completed()
                     return
                 yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
                 yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
+                log_stream_completed()
                 return
             if current_status == "failed":
-                yield _sse("error", {"message": job.get("error_message", "Analysis failed. Please try again.")})
+                yield _sse(
+                    "error",
+                    {
+                        "reason": job.get("error_reason", "unknown"),
+                        "message": job.get(
+                            "error_message",
+                            "Analysis failed. Please try again.",
+                        ),
+                    },
+                )
+                log_stream_completed()
                 return
             await asyncio.sleep(0.2)
 
@@ -294,47 +365,6 @@ async def stream_analysis(
 
 def _sse(event: str, data: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-async def _run_analysis_job(
-    note: Note,
-    job_id: str,
-    db: FirestoreClient,
-    gemini: GeminiClient,
-    settings: Settings,
-) -> None:
-    try:
-        analysis = await _analyze_and_persist(note, db, gemini, settings)
-        await db.finish_analysis_job(
-            job_id=job_id,
-            status="failed" if analysis.is_failed else "completed",
-            analysis_id=analysis.id,
-            error_message=(
-                "Analysis failed. Please try again."
-                if analysis.is_failed
-                else None
-            ),
-        )
-    except Exception:
-        logger.exception("Analysis job failed for note %s", note.id)
-        await db.finish_analysis_job(
-            job_id=job_id,
-            status="failed",
-            error_message="Analysis failed. Please try again.",
-        )
-
-
-def _note_after_analysis(note: Note, analysis: Analysis) -> Note:
-    """Apply the post-persist note fields without an extra Firestore read."""
-    return note.model_copy(
-        update={
-            "latest_analysis_id": analysis.id,
-            "review_status": ReviewStatus.PENDING,
-            "condition_count": (
-                0 if analysis.is_failed else len(analysis.conditions)
-            ),
-        }
-    )
 
 
 async def _require_owned_note(
@@ -358,96 +388,3 @@ async def _require_owned_note(
         )
     return note
 
-
-async def _analyze_and_persist(
-    note: Note,
-    db: FirestoreClient,
-    gemini: GeminiClient,
-    settings: Settings,
-) -> Analysis:
-    """Run Gemini, persist the analysis, and point the note at it."""
-    analysis_id = str(uuid.uuid4())
-
-    try:
-        result = await gemini.analyze_note(note.raw_text)
-        analysis = Analysis(
-            id=analysis_id,
-            note_id=note.id,
-            user_id=note.user_id,
-            conditions=tuple(result.conditions),
-            gaps=tuple(result.gaps),
-            summary=result.summary,
-            model_version=result.model_version,
-            prompt_version=result.prompt_version,
-            is_failed=False,
-            failure_reason=None,
-        )
-    except GeminiAnalysisError as exc:
-        logger.warning("Gemini analysis failed for note %s", note.id)
-        analysis = _create_failed_analysis(
-            analysis_id=analysis_id,
-            note=note,
-            settings=settings,
-            failure_reason=str(exc),
-        )
-    except Exception:
-        logger.exception("Unexpected analysis failure for note %s", note.id)
-        analysis = _create_failed_analysis(
-            analysis_id=analysis_id,
-            note=note,
-            settings=settings,
-            failure_reason="Unexpected analysis service failure",
-        )
-
-    condition_count = 0 if analysis.is_failed else len(analysis.conditions)
-
-    try:
-        await db.persist_analysis_for_note(
-            analysis,
-            condition_count=condition_count,
-        )
-    except (PermissionError, LookupError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Note not found",
-        ) from exc
-    except DocumentConflictError as exc:
-        logger.error("Analysis ID conflict for note %s", note.id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Analysis could not be saved",
-        ) from exc
-    except DocumentDataError as exc:
-        logger.error("Corrupt data while saving analysis for note %s", note.id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Analysis could not be saved",
-        ) from exc
-    except Exception as exc:
-        logger.exception("Unexpected failure saving analysis for note %s", note.id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Analysis could not be saved",
-        ) from exc
-
-    return analysis
-
-
-def _create_failed_analysis(
-    analysis_id: str,
-    note: Note,
-    settings: Settings,
-    failure_reason: str,
-) -> Analysis:
-    return Analysis(
-        id=analysis_id,
-        note_id=note.id,
-        user_id=note.user_id,
-        conditions=(),
-        gaps=(),
-        summary="Analysis could not be completed. Please try again.",
-        model_version=settings.gemini_model,
-        prompt_version=PROMPT_VERSION,
-        is_failed=True,
-        failure_reason=failure_reason[:2000],
-    )

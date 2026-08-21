@@ -63,6 +63,10 @@ def _make_client(monkeypatch: pytest.MonkeyPatch) -> GeminiClient:
 NOTE = "Patient has Type 2 diabetes, controlled on metformin."
 
 
+class GeminiQuotaError(RuntimeError):
+    code = 429
+
+
 @pytest.mark.asyncio
 async def test_empty_note_does_not_call_gemini(
     monkeypatch: pytest.MonkeyPatch,
@@ -79,7 +83,9 @@ async def test_empty_note_does_not_call_gemini(
 @pytest.mark.asyncio
 async def test_valid_response_returns_conditions_gaps_and_versions(
     monkeypatch: pytest.MonkeyPatch,
+    caplog,
 ) -> None:
+    caplog.set_level("INFO")
     client = _make_client(monkeypatch)
     client._call_model = AsyncMock(return_value=json.dumps(_valid_payload()))
 
@@ -92,6 +98,154 @@ async def test_valid_response_returns_conditions_gaps_and_versions(
     assert result.conditions[0].id
     assert result.conditions[0].quote_verified is True
     assert result.gaps[0].description == "A1C value not documented"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "gemini_attempt_completed" in message
+        and "attempt=1" in message
+        and "duration_ms=" in message
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_gemini_api_and_response_processing_timing_events(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    caplog.set_level("INFO")
+    client = _make_client(monkeypatch)
+    response = MagicMock()
+    response.parsed = None
+    response.text = json.dumps(_valid_payload())
+    client._client.aio.models.generate_content = AsyncMock(return_value=response)
+
+    await client.analyze_note(NOTE)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "gemini_api_completed" in message
+        and "attempt=1" in message
+        and "duration_ms=" in message
+        for message in messages
+    )
+    assert any(
+        "gemini_response_processing_completed" in message
+        and "attempt=1" in message
+        and "duration_ms=" in message
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_response_emits_safe_structural_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    caplog.set_level("INFO")
+    client = _make_client(monkeypatch)
+    response = MagicMock()
+    response.parsed = None
+    response.text = json.dumps(_valid_payload())
+    response.usage_metadata = MagicMock(
+        prompt_token_count=100,
+        candidates_token_count=42,
+        total_token_count=142,
+    )
+    client._client.aio.models.generate_content = AsyncMock(return_value=response)
+
+    await client.analyze_note(NOTE)
+
+    metrics = next(
+        record.getMessage()
+        for record in caplog.records
+        if "gemini_response_metrics" in record.getMessage()
+    )
+    assert "attempt=1" in metrics
+    assert "condition_count=1" in metrics
+    assert "gap_count=1" in metrics
+    payload = _valid_payload()
+    assert f"summary_char_count={len(payload['summary'])}" in metrics
+    assert (
+        "max_evidence_quote_char_count="
+        f"{len(payload['conditions'][0]['evidence_quote'])}"
+    ) in metrics
+    assert f"total_response_char_count={len(response.text)}" in metrics
+    assert "input_tokens=100" in metrics
+    assert "output_tokens=42" in metrics
+    assert "total_tokens=142" in metrics
+    assert "Follow-up visit" not in metrics
+    assert "Type 2 diabetes" not in metrics
+
+
+@pytest.mark.asyncio
+async def test_missing_token_metadata_does_not_break_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    caplog.set_level("INFO")
+    client = _make_client(monkeypatch)
+    response = MagicMock()
+    response.parsed = None
+    response.text = json.dumps(_valid_payload())
+    response.usage_metadata = None
+    client._client.aio.models.generate_content = AsyncMock(return_value=response)
+
+    await client.analyze_note(NOTE)
+
+    metrics = next(
+        record.getMessage()
+        for record in caplog.records
+        if "gemini_response_metrics" in record.getMessage()
+    )
+    assert "condition_count=1" in metrics
+    assert "input_tokens=" not in metrics
+    assert "output_tokens=" not in metrics
+    assert "total_tokens=" not in metrics
+
+
+@pytest.mark.asyncio
+async def test_failed_response_does_not_emit_success_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    caplog.set_level("INFO")
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=RuntimeError("provider failure")
+    )
+
+    with pytest.raises(GeminiAnalysisError):
+        await client.analyze_note(NOTE)
+
+    assert not any(
+        "gemini_response_metrics" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_emits_metrics_only_for_successful_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    caplog.set_level("INFO")
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[
+            json.dumps({"conditions": [], "gaps": [], "summary": "   "}),
+            json.dumps(_valid_payload()),
+        ]
+    )
+
+    await client.analyze_note(NOTE)
+
+    metrics = [
+        record.getMessage()
+        for record in caplog.records
+        if "gemini_response_metrics" in record.getMessage()
+    ]
+    assert len(metrics) == 1
+    assert "attempt=2" in metrics[0]
 
 
 @pytest.mark.asyncio
@@ -216,11 +370,165 @@ async def test_provider_errors_retry_then_fail(
     client._call_model = AsyncMock(
         side_effect=[RuntimeError("timeout"), RuntimeError("timeout")]
     )
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
 
     with pytest.raises(GeminiAnalysisError):
         await client.analyze_note("Patient presents with cough.")
 
     assert client._call_model.await_count == 2
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_429_retry_uses_provider_delay(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    caplog.set_level("INFO")
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 15.44s"), json.dumps(_valid_payload())]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
+
+    result = await client.analyze_note(NOTE)
+
+    assert result.summary.startswith("Follow-up")
+    sleep.assert_awaited_once_with(15.44)
+    retry_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if "gemini_retry_scheduled" in record.getMessage()
+    )
+    assert "attempt=1" in retry_log
+    assert "error_type=429" in retry_log
+    assert "retry_delay_ms=15440" in retry_log
+    assert "delay_source=provider" in retry_log
+
+
+@pytest.mark.asyncio
+async def test_429_retry_uses_fallback_delay_when_provider_delay_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED"), json.dumps(_valid_payload())]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
+
+    await client.analyze_note(NOTE)
+
+    sleep.assert_awaited_once_with(gemini_module._429_FALLBACK_DELAY_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_429_retry_delay_is_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 999s"), json.dumps(_valid_payload())]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
+
+    await client.analyze_note(NOTE)
+
+    sleep.assert_awaited_once_with(gemini_module._429_MAX_DELAY_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_final_429_does_not_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[
+            GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 15.44s"),
+            GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 15.44s"),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(GeminiAnalysisError):
+        await client.analyze_note(NOTE)
+
+    sleep.assert_awaited_once_with(15.44)
+
+
+@pytest.mark.asyncio
+async def test_final_429_is_classified_as_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED"), GeminiQuotaError("429 RESOURCE_EXHAUSTED")]
+    )
+
+    with pytest.raises(GeminiAnalysisError) as exc_info:
+        await client.analyze_note(NOTE)
+
+    assert exc_info.value.failure_reason == "rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_invalid_output_is_classified_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(side_effect=["{bad", "{still bad"])
+
+    with pytest.raises(GeminiAnalysisError) as exc_info:
+        await client.analyze_note(NOTE)
+
+    assert exc_info.value.failure_reason == "invalid_output"
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_classified_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[TimeoutError("provider timeout"), TimeoutError("provider timeout")]
+    )
+
+    with pytest.raises(GeminiAnalysisError) as exc_info:
+        await client.analyze_note(NOTE)
+
+    assert exc_info.value.failure_reason == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_provider_error_is_classified_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(
+        side_effect=[RuntimeError("provider unavailable"), RuntimeError("provider unavailable")]
+    )
+
+    with pytest.raises(GeminiAnalysisError) as exc_info:
+        await client.analyze_note(NOTE)
+
+    assert exc_info.value.failure_reason == "provider_error"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_internal_error_is_classified_as_internal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock(side_effect=AttributeError("missing response"))
+
+    with pytest.raises(GeminiAnalysisError) as exc_info:
+        await client.analyze_note(NOTE)
+
+    assert exc_info.value.failure_reason == "internal_error"
 
 
 @pytest.mark.asyncio
@@ -260,7 +568,7 @@ async def test_prompt_keeps_braces_from_note_text(
     note = "Dose {special} noted. Type 2 diabetes, controlled on metformin."
     captured: list[str] = []
 
-    async def _capture(prompt: str) -> str:
+    async def _capture(prompt: str, attempt: int) -> str:
         captured.append(prompt)
         return json.dumps(_valid_payload())
 

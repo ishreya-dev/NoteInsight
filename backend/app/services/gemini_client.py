@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 import unicodedata
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -26,12 +29,23 @@ from app.models.analysis import (
 
 logger = logging.getLogger(__name__)
 
+_response_processing_started_at: ContextVar[float | None] = ContextVar(
+    "response_processing_started_at",
+    default=None,
+)
+_response_usage_metadata: ContextVar[dict[str, int] | None] = ContextVar(
+    "response_usage_metadata",
+    default=None,
+)
+
 _PROMPT_PATH = (
     Path(__file__).resolve().parent.parent / "prompts" / "analysis_prompt.txt"
 )
 _NOTE_PLACEHOLDER = "{note_text}"
 PROMPT_VERSION = "v1"
 _MAX_ATTEMPTS = 2
+_429_FALLBACK_DELAY_SECONDS = 1.0
+_429_MAX_DELAY_SECONDS = 30.0
 _DOCUMENTATION_STATUS_ALIASES = {
     "documented": "well_documented",
     "well-documented": "well_documented",
@@ -98,6 +112,18 @@ _FENCE_PATTERN = re.compile(
 
 class GeminiAnalysisError(RuntimeError):
     """Raised when Gemini fails to produce valid structured output."""
+
+    def __init__(self, message: str, *, failure_reason: str = "unknown") -> None:
+        super().__init__(message)
+        self.failure_reason = failure_reason
+
+
+def _failure_reason_for_exception(exc: Exception) -> str:
+    if _is_resource_exhausted(exc):
+        return "rate_limited"
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return "timeout"
+    return "provider_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +221,23 @@ def _status_code_from_exception(exc: Exception) -> int | str | None:
     return None
 
 
+def _is_resource_exhausted(exc: Exception) -> bool:
+    status_code = _status_code_from_exception(exc)
+    if status_code == 429 or str(status_code).upper() == "RESOURCE_EXHAUSTED":
+        return True
+    message = str(exc).upper()
+    return "RESOURCE_EXHAUSTED" in message or "429" in message
+
+
+def _retry_delay_from_exception(exc: Exception) -> tuple[float, str]:
+    match = re.search(r"retry\s+in\s+(\d+(?:\.\d+)?)\s*s", str(exc), re.IGNORECASE)
+    if match is None:
+        return _429_FALLBACK_DELAY_SECONDS, "fallback"
+
+    requested_delay = float(match.group(1))
+    return min(requested_delay, _429_MAX_DELAY_SECONDS), "provider"
+
+
 def _normalize_documentation_status(value: object) -> object:
     if value is None:
         return value
@@ -261,11 +304,19 @@ class GeminiClient:
         )
         request_contents = base_prompt
         last_error: Exception | None = None
+        last_failure_reason = "invalid_output"
         raw_response_text = ""
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            attempt_started_at = time.perf_counter()
+            processing_token = _response_processing_started_at.set(None)
+            usage_token = _response_usage_metadata.set(None)
             try:
-                raw_text = await self._call_model(request_contents)
+                raw_text = await self._call_model(request_contents, attempt)
+                processing_started_at = _response_processing_started_at.get()
+                if processing_started_at is None:
+                    processing_started_at = time.perf_counter()
+                    _response_processing_started_at.set(processing_started_at)
                 raw_response_text = raw_text
                 cleaned = strip_markdown_fences(raw_text)
                 if not cleaned:
@@ -280,10 +331,18 @@ class GeminiClient:
 
                 normalized = _normalize_response_payload(parsed_obj)
                 parsed = GeminiRawResponse.model_validate(normalized)
-                return self._to_result(parsed, note_text)
+                result = self._to_result(parsed, note_text)
+                self._log_response_metrics(
+                    attempt=attempt,
+                    result=result,
+                    response_text=raw_text,
+                    usage_metadata=_response_usage_metadata.get(),
+                )
+                return result
 
             except (ValidationError, ValueError) as exc:
                 last_error = exc
+                last_failure_reason = "invalid_output"
                 logger.warning(
                     "Gemini output validation failed on attempt %d/%d model=%s "
                     "error=%s raw_response=%s",
@@ -307,11 +366,13 @@ class GeminiClient:
                     self._settings.gemini_model,
                 )
                 raise GeminiAnalysisError(
-                    "Gemini analysis failed due to an internal error"
+                    "Gemini analysis failed due to an internal error",
+                    failure_reason="internal_error",
                 ) from exc
 
             except Exception as exc:
                 last_error = exc
+                last_failure_reason = _failure_reason_for_exception(exc)
                 logger.warning(
                     "Gemini API request failed on attempt %d/%d model=%s "
                     "error_type=%s error_message=%s status_code=%s",
@@ -324,22 +385,113 @@ class GeminiClient:
                 )
                 if attempt < _MAX_ATTEMPTS:
                     request_contents = base_prompt
+                    if _is_resource_exhausted(exc):
+                        retry_delay, delay_source = _retry_delay_from_exception(exc)
+                        logger.info(
+                            "gemini_retry_scheduled attempt=%d error_type=429 "
+                            "retry_delay_ms=%d delay_source=%s",
+                            attempt,
+                            round(retry_delay * 1000),
+                            delay_source,
+                        )
+                        await asyncio.sleep(retry_delay)
+            finally:
+                processing_started_at = _response_processing_started_at.get()
+                if processing_started_at is not None:
+                    logger.info(
+                        "gemini_response_processing_completed attempt=%d "
+                        "duration_ms=%d",
+                        attempt,
+                        round((time.perf_counter() - processing_started_at) * 1000),
+                    )
+                _response_processing_started_at.reset(processing_token)
+                _response_usage_metadata.reset(usage_token)
+                logger.info(
+                    "gemini_attempt_completed attempt=%d duration_ms=%d",
+                    attempt,
+                    round((time.perf_counter() - attempt_started_at) * 1000),
+                )
 
         raise GeminiAnalysisError(
-            f"Gemini did not return valid output after {_MAX_ATTEMPTS} attempts"
+            f"Gemini did not return valid output after {_MAX_ATTEMPTS} attempts",
+            failure_reason=last_failure_reason,
         ) from last_error
 
-    async def _call_model(self, prompt: str) -> str:
+    @staticmethod
+    def _log_response_metrics(
+        *,
+        attempt: int,
+        result: AnalysisResult,
+        response_text: str,
+        usage_metadata: dict[str, int] | None,
+    ) -> None:
+        fields = [
+            f"attempt={attempt}",
+            f"condition_count={len(result.conditions)}",
+            f"gap_count={len(result.gaps)}",
+            f"summary_char_count={len(result.summary)}",
+            "max_evidence_quote_char_count="
+            f"{max((len(condition.evidence_quote) for condition in result.conditions), default=0)}",
+            f"total_response_char_count={len(response_text)}",
+        ]
+        if usage_metadata is not None:
+            fields.extend(
+                f"{name}={usage_metadata[name]}"
+                for name in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                )
+                if name in usage_metadata
+            )
+        logger.info("gemini_response_metrics %s", " ".join(fields))
+
+    async def _call_model(self, prompt: str, attempt: int) -> str:
         """Call Gemini and return a non-empty JSON response body."""
-        response = await self._client.aio.models.generate_content(
-            model=self._settings.gemini_model,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=_RESPONSE_SCHEMA,
-                temperature=0.2,
-            ),
-        )
+        api_started_at = time.perf_counter()
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=self._settings.gemini_model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=_RESPONSE_SCHEMA,
+                    temperature=0.2,
+                ),
+            )
+            usage_metadata = getattr(response, "usage_metadata", None)
+            if usage_metadata is not None:
+                token_fields = {
+                    "input_tokens": getattr(
+                        usage_metadata,
+                        "prompt_token_count",
+                        None,
+                    ),
+                    "output_tokens": getattr(
+                        usage_metadata,
+                        "candidates_token_count",
+                        None,
+                    ),
+                    "total_tokens": getattr(
+                        usage_metadata,
+                        "total_token_count",
+                        None,
+                    ),
+                }
+                _response_usage_metadata.set(
+                    {
+                        name: value
+                        for name, value in token_fields.items()
+                        if isinstance(value, int) and not isinstance(value, bool)
+                    }
+                )
+            _response_processing_started_at.set(time.perf_counter())
+        finally:
+            logger.info(
+                "gemini_api_completed attempt=%d duration_ms=%d",
+                attempt,
+                round((time.perf_counter() - api_started_at) * 1000),
+            )
 
         parsed = getattr(response, "parsed", None)
         if isinstance(parsed, dict):

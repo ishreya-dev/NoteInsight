@@ -62,3 +62,70 @@ def test_protected_endpoint_rejects_invalid_token(
         "not-a-real-token",
         check_revoked=True,
     )
+
+
+def test_firebase_credential_failure_is_categorized_and_preserves_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.dependencies as dependencies
+
+    original_error = RuntimeError("invalid service account")
+    monkeypatch.setattr(
+        dependencies.firebase_admin,
+        "get_app",
+        MagicMock(side_effect=ValueError("app is not initialized")),
+    )
+    monkeypatch.setattr(
+        dependencies,
+        "get_settings",
+        lambda: MagicMock(
+            firebase_service_account_path="service-account.json",
+            firebase_project_id="demo-project",
+        ),
+    )
+    monkeypatch.setattr(
+        dependencies.credentials,
+        "Certificate",
+        MagicMock(side_effect=original_error),
+    )
+
+    with pytest.raises(RuntimeError, match="Firebase initialization failed") as exc_info:
+        dependencies._init_firebase_app()
+
+    assert exc_info.value.__cause__ is original_error
+
+
+def test_firebase_initialize_failure_is_categorized_and_preserves_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.dependencies as dependencies
+
+    original_error = RuntimeError("firebase provider unavailable")
+    monkeypatch.setattr(
+        dependencies.firebase_admin,
+        "get_app",
+        MagicMock(side_effect=ValueError("app is not initialized")),
+    )
+    monkeypatch.setattr(
+        dependencies,
+        "get_settings",
+        lambda: MagicMock(
+            firebase_service_account_path=None,
+            firebase_project_id="demo-project",
+        ),
+    )
+    monkeypatch.setattr(
+        dependencies.credentials,
+        "ApplicationDefault",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        dependencies.firebase_admin,
+        "initialize_app",
+        MagicMock(side_effect=original_error),
+    )
+
+    with pytest.raises(RuntimeError, match="Firebase initialization failed") as exc_info:
+        dependencies._init_firebase_app()
+
+    assert exc_info.value.__cause__ is original_error

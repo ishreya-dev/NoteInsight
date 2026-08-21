@@ -30,17 +30,21 @@ def _init_firebase_app() -> None:
 
     settings = get_settings()
 
-    if settings.firebase_service_account_path:
-        credential = credentials.Certificate(
-            settings.firebase_service_account_path
-        )
-    else:
-        credential = credentials.ApplicationDefault()
+    try:
+        if settings.firebase_service_account_path:
+            credential = credentials.Certificate(
+                settings.firebase_service_account_path
+            )
+        else:
+            credential = credentials.ApplicationDefault()
 
-    firebase_admin.initialize_app(
-        credential,
-        {"projectId": settings.firebase_project_id},
-    )
+        firebase_admin.initialize_app(
+            credential,
+            {"projectId": settings.firebase_project_id},
+        )
+    except Exception as exc:
+        logger.exception("Firebase initialization failed")
+        raise RuntimeError("Firebase initialization failed") from exc
 
 
 _init_firebase_app()

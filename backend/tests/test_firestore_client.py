@@ -202,6 +202,43 @@ async def test_get_note_returns_none_for_other_user() -> None:
 
 
 @pytest.mark.asyncio
+async def test_claim_analysis_job_distinguishes_claim_winner_from_existing_processing() -> None:
+    pending_snapshot = MagicMock()
+    pending_snapshot.exists = True
+    pending_snapshot.to_dict.return_value = {
+        "user_id": "user-a",
+        "status": "pending",
+    }
+    processing_snapshot = MagicMock()
+    processing_snapshot.exists = True
+    processing_snapshot.to_dict.return_value = {
+        "user_id": "user-a",
+        "status": "processing",
+    }
+
+    job_ref = MagicMock()
+    job_ref.get = AsyncMock(side_effect=[pending_snapshot, processing_snapshot])
+    transaction = MagicMock()
+    client = FirestoreClient.__new__(FirestoreClient)
+    client._db = MagicMock()
+    client._db.collection.return_value.document.return_value = job_ref
+    client._db.transaction.return_value = transaction
+
+    first_result = await client.claim_analysis_job(
+        job_id="job-1",
+        user_id="user-a",
+    )
+    second_result = await client.claim_analysis_job(
+        job_id="job-1",
+        user_id="user-a",
+    )
+
+    assert first_result == "claimed"
+    assert second_result == "processing"
+    transaction.update.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_list_notes_filters_orders_and_limits_query(monkeypatch) -> None:
     snapshot = MagicMock()
     snapshot.id = "note-a"

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
+import { getFailureDisplay } from "../api/failure";
 import { ApiError } from "../api/errors";
 import { useAuth } from "../auth/useAuth";
 import type {
@@ -49,8 +50,8 @@ export default function NewNotePage() {
           setResult({ note, analysis: event.analysis });
           setStatus("success");
         },
-        onError: async (message) => {
-          setError(message);
+        onError: async ({ reason }) => {
+          setError(getFailureDisplay(reason).message);
           const detail = await api.getNote(note.id).catch(() => null);
           setResult(detail ? { note: detail.note, analysis: detail.analysis } : { note, analysis: null });
           setStatus("error");
@@ -161,10 +162,6 @@ export default function NewNotePage() {
             onRetry={handleRetryAnalysis}
             retrying={isLoading}
           />
-
-          {error && (
-            <ErrorState message={error} />
-          )}
 
           <button
             type="button"

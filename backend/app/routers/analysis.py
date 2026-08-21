@@ -80,7 +80,8 @@ async def upsert_review(
     """Create or update the single review for an analysis.
 
     Review document ID is ``analysis_id``. Note review state is updated in the
-    same transaction only when this analysis is still the note's latest.
+    and the note's review state is updated separately only when this analysis
+    is still the note's latest.
     """
     analysis = await _require_owned_analysis(
         db,

@@ -17,6 +17,13 @@ export type ConditionReviewStatus =
 
 export type NoteReviewStatus = "pending" | "reviewed";
 
+export type AnalysisFailureReason =
+  | "rate_limited"
+  | "invalid_output"
+  | "timeout"
+  | "provider_error"
+  | "unknown";
+
 export interface Condition {
   id: string;
   condition_name: string;
@@ -43,7 +50,7 @@ export interface Analysis {
   prompt_version: string;
   created_at: string;
   is_failed: boolean;
-  failure_reason: string | null;
+  failure_reason: AnalysisFailureReason | null;
 }
 
 export interface Note {

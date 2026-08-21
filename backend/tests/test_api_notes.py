@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 
 from app.models.note import NoteListItem, ReviewStatus
 from app.models.user import AuthenticatedUser
-from app.services.gemini_client import GeminiAnalysisError
 from tests.conftest import TEST_USER, make_analysis, make_note, make_review
 
 
@@ -37,13 +36,12 @@ def test_create_note_success(
     gemini.analyze_note.assert_not_awaited()
 
 
-def test_create_note_persists_failed_analysis_when_gemini_fails(
+def test_create_note_creates_job_without_calling_gemini(
     client: TestClient,
     db: AsyncMock,
     gemini: AsyncMock,
 ) -> None:
     db.create_note.return_value = make_note()
-    gemini.analyze_note.side_effect = GeminiAnalysisError("provider failed")
 
     response = client.post(
         "/notes",
@@ -55,6 +53,7 @@ def test_create_note_persists_failed_analysis_when_gemini_fails(
     assert response.status_code == 202
     body = response.json()
     assert body["job_id"]
+    db.create_analysis_job.assert_awaited_once()
     gemini.analyze_note.assert_not_awaited()
 
 
@@ -247,7 +246,7 @@ def test_reanalysis_preserves_previous_analysis(
     assert note.latest_analysis_id == old_analysis.id
 
 
-def test_persist_failure_returns_safe_500(
+def test_create_note_returns_safe_500_when_analysis_job_creation_fails(
     client: TestClient,
     db: AsyncMock,
 ) -> None:

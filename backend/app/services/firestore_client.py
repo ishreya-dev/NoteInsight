@@ -154,6 +154,7 @@ class FirestoreClient:
         await create(transaction)
 
     async def claim_analysis_job(self, *, job_id: str, user_id: str) -> str | None:
+        """Claim a pending job or return its current status."""
         job_ref = self._db.collection(_ANALYSIS_JOBS_COLLECTION).document(job_id)
         transaction = self._db.transaction()
         claimed_status: str | None = None
@@ -170,7 +171,7 @@ class FirestoreClient:
             claimed_status = data.get("status")
             if claimed_status == "pending":
                 transaction.update(job_ref, {"status": "processing"})
-                claimed_status = "processing"
+                claimed_status = "claimed"
 
         await claim(transaction)
         return claimed_status
@@ -195,12 +196,15 @@ class FirestoreClient:
         status: str,
         analysis_id: str | None = None,
         error_message: str | None = None,
+        error_reason: str | None = None,
     ) -> None:
         data: dict[str, Any] = {"status": status}
         if analysis_id is not None:
             data["analysis_id"] = analysis_id
         if error_message is not None:
             data["error_message"] = error_message
+        if error_reason is not None:
+            data["error_reason"] = error_reason
         await (
             self._db.collection(_ANALYSIS_JOBS_COLLECTION)
             .document(job_id)

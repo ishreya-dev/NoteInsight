@@ -1,3 +1,4 @@
+import { getFailureDisplay } from "../api/failure";
 import type { Analysis } from "../api/types";
 
 interface FailedAnalysisNoticeProps {
@@ -11,20 +12,12 @@ export default function FailedAnalysisNotice({
   onRetry,
   retrying,
 }: FailedAnalysisNoticeProps) {
+  const display = getFailureDisplay(analysis.failure_reason);
+
   return (
     <div role="alert" className="failed-analysis-notice">
-      <h3>Analysis failed</h3>
-      <p>
-        The model could not produce a valid analysis for this note.
-        {analysis.failure_reason && (
-          <>
-            {" "}
-            <span className="failed-analysis-reason">
-              {analysis.failure_reason}
-            </span>
-          </>
-        )}
-      </p>
+      <h3>{display.title}</h3>
+      <p>{display.message}</p>
       <button type="button" onClick={onRetry} disabled={retrying}>
         {retrying ? "Retrying…" : "Retry analysis"}
       </button>
