@@ -24,6 +24,7 @@ from app.services.gemini_client import (
     strip_markdown_fences,
     _normalize_response_payload,
     verify_evidence_quote,
+    extract_json_after_data,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ async def stream_analysis_and_persist(
     db: FirestoreClient,
     gemini: GeminiClient,
     settings: Settings,
+    raw_text: str | None = None,
 ) -> Analysis:
     analysis_id = str(uuid.uuid4())
     cache_key = "{}:{}:{}".format(
@@ -44,13 +46,15 @@ async def stream_analysis_and_persist(
 
     result = None
     try:
-        result = await _get_cached_result(db, cache_key)
+        if raw_text is None:
+            result = await _get_cached_result(db, cache_key)
         if result is None:
-            full_text_parts: list[str] = []
-            async for chunk in gemini.stream_analyze_note(note.raw_text):
-                full_text_parts.append(chunk)
-            raw_text = "".join(full_text_parts)
-            cleaned = strip_markdown_fences(raw_text)
+            if raw_text is None:
+                full_text_parts: list[str] = []
+                async for chunk in gemini.stream_analyze_note(note.raw_text):
+                    full_text_parts.append(chunk)
+                raw_text = "".join(full_text_parts)
+            cleaned = extract_json_after_data(strip_markdown_fences(raw_text))
             if not cleaned:
                 raise ValueError("Gemini returned an empty response")
             try:

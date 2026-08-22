@@ -110,6 +110,16 @@ _FENCE_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_DATA_MARKER = "DATA:"
+
+
+def extract_json_after_data(text: str) -> str:
+    """Return the JSON payload that follows a ``DATA:`` marker, if present."""
+    index = text.find(_DATA_MARKER)
+    if index == -1:
+        return text
+    return text[index + len(_DATA_MARKER):]
+
 
 class GeminiAnalysisError(RuntimeError):
     """Raised when Gemini fails to produce valid structured output."""
@@ -576,8 +586,6 @@ class GeminiClient:
                 model=self._settings.gemini_model,
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=_RESPONSE_SCHEMA,
                     temperature=0.2,
                 ),
             )
@@ -636,8 +644,6 @@ class GeminiClient:
                 model=self._settings.gemini_model,
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=_RESPONSE_SCHEMA,
                     temperature=0.2,
                 ),
             )
@@ -682,7 +688,7 @@ class GeminiClient:
         text = getattr(response, "text", None)
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Gemini returned an empty response")
-        return text
+        return extract_json_after_data(text)
 
     def _to_result(
         self,

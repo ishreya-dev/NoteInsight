@@ -299,11 +299,37 @@ async def stream_analysis(
                 yield _sse("status", {"stage": "preparing", "message": "Preparing clinical analysis..."})
                 try:
                     analysis = None
+                    raw_parts: list[str] = []
+                    buffer = ""
+                    emitted_len = 0
+                    summary_start: int | None = None
+                    data_reached = False
+                    summary_marker = "SUMMARY:"
+                    data_marker = "DATA:"
                     async for chunk in gemini.stream_analyze_note(note.raw_text):
                         if time.perf_counter() > deadline_at:
                             raise asyncio.TimeoutError()
-                        yield _sse("token", {"text": chunk})
-                    analysis = await stream_analysis_and_persist(note, db, gemini, settings)
+                        raw_parts.append(chunk)
+                        buffer += chunk
+                        if data_reached:
+                            continue
+                        if summary_start is None:
+                            found = buffer.find(summary_marker)
+                            if found != -1:
+                                summary_start = found + len(summary_marker)
+                                emitted_len = summary_start
+                        if summary_start is not None:
+                            data_idx = buffer.find(data_marker, summary_start)
+                            send_upto = data_idx if data_idx != -1 else len(buffer)
+                            if send_upto > emitted_len:
+                                yield _sse("token", {"text": buffer[emitted_len:send_upto]})
+                                emitted_len = send_upto
+                            if data_idx != -1:
+                                data_reached = True
+                    analysis = await stream_analysis_and_persist(
+                        note, db, gemini, settings, raw_text="".join(raw_parts)
+                    )
+                    await _persist_and_finish(db, note, job_id, analysis)
                 except GeminiAnalysisError as exc:
                     analysis = _create_failed_analysis(
                         note=note,

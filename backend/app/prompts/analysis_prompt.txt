@@ -94,17 +94,15 @@ If the note is empty, contains only whitespace, is nonsensical, or contains no e
 
 OUTPUT REQUIREMENTS
 
-Return only a single valid JSON object.
+First, write a clear, human-readable clinical summary as plain prose for the physician. Begin the summary on a new line immediately after this exact marker (no extra text before it):
 
-Do not include:
+SUMMARY:
 
-- Markdown
-- Code fences
-- Explanations
-- Preamble
-- Additional text
+After the summary, on its own line, output this exact marker:
 
-The response must match exactly this structure:
+DATA:
+
+Immediately after the DATA: marker, return a single valid JSON object (no markdown, no code fences, no additional text) that matches exactly this structure:
 
 {
   "conditions": [
@@ -124,6 +122,8 @@ The response must match exactly this structure:
   ],
   "summary": "string"
 }
+
+The "summary" field in the JSON must contain the same text as the prose summary written after SUMMARY:. The JSON object must be the final part of the response.
 
 CLINICAL NOTE
 
