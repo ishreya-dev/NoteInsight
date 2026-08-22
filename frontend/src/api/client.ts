@@ -18,6 +18,7 @@ const DEFAULT_TIMEOUT = 15_000;
 export type AnalysisStreamHandlers = {
   signal?: AbortSignal;
   onStatus: (status: import("./types").AnalysisStreamStatus) => void;
+  onToken: (text: string) => void;
   onComplete: (result: import("./types").AnalysisStreamComplete) => void;
   onError: (error: {
     reason: AnalysisFailureReason;
@@ -142,6 +143,10 @@ export const api = {
           const parsed: unknown = JSON.parse(data);
           if (event === "status") {
             handlers.onStatus(parsed as import("./types").AnalysisStreamStatus);
+          } else if (event === "token") {
+            handlers.onToken?.(
+              (parsed as { text: string }).text
+            );
           } else if (event === "complete") {
             handlers.onComplete(parsed as import("./types").AnalysisStreamComplete);
           } else if (event === "error") {

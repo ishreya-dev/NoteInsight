@@ -55,7 +55,7 @@ async def get_analysis(
             current_user.uid,
         )
     except DocumentDataError as exc:
-        logger.error("Corrupt review for analysis '%s'", analysis.id)
+        logger.exception("Corrupt review for analysis '%s'", analysis.id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Review could not be loaded",
@@ -79,9 +79,8 @@ async def upsert_review(
 ) -> Review:
     """Create or update the single review for an analysis.
 
-    Review document ID is ``analysis_id``. Note review state is updated in the
-    and the note's review state is updated separately only when this analysis
-    is still the note's latest.
+    Review document ID is ``analysis_id``. The note's review state is updated
+    separately, and only when this analysis is still the note's latest.
     """
     analysis = await _require_owned_analysis(
         db,
@@ -110,13 +109,8 @@ async def upsert_review(
             payload=payload,
             condition_count=condition_count,
         )
-    except (PermissionError, LookupError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Analysis not found",
-        ) from exc
     except DocumentDataError as exc:
-        logger.error("Corrupt data during review upsert for '%s'", analysis_id)
+        logger.exception("Corrupt data during review upsert for '%s'", analysis_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Review could not be saved",
@@ -142,7 +136,7 @@ async def _require_owned_analysis(
     try:
         analysis = await db.get_analysis(analysis_id, user_id)
     except DocumentDataError as exc:
-        logger.error("Corrupt analysis document '%s'", analysis_id)
+        logger.exception("Corrupt analysis document '%s'", analysis_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Analysis could not be loaded",

@@ -8,7 +8,7 @@ import AnalysisReview from "../components/AnalysisReview";
 import FailedAnalysisNotice from "../components/FailedAnalysisNotice";
 import LoadingState from "../components/LoadingState";
 import ErrorState from "../components/ErrorState";
-import AnalysisProgress from "../components/AnalysisProgress";
+import StreamingAnalysis from "../components/StreamingAnalysis";
 
 export default function NoteDetailPage() {
   const { noteId } = useParams<{ noteId: string }>();
@@ -30,7 +30,7 @@ export default function NoteDetailPage() {
 
   const [retrying, setRetrying] =
     useState(false);
-  const [stage, setStage] = useState("preparing");
+  const [streamingText, setStreamingText] = useState("");
   const streamAbort = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
@@ -60,33 +60,24 @@ export default function NoteDetailPage() {
     }
   }, [noteId]);
 
-  useEffect(() => {
-    void load();
-    return () => streamAbort.current?.abort();
-  }, [load]);
-
-  async function handleRetryAnalysis() {
-    if (!noteId || retrying) return;
-
-    setRetrying(true);
-    setError(null);
-
+  async function startStream(targetNoteId: string) {
+    streamAbort.current?.abort();
+    const controller = new AbortController();
+    streamAbort.current = controller;
+    setStreamingText("");
     try {
-      const res = await api.reanalyzeNote(noteId);
-
-      setNote(res.note);
-      setAnalysis(null);
-      setReview(null);
-      setStage("preparing");
-
-      const controller = new AbortController();
-      streamAbort.current = controller;
-      await api.streamAnalysis(noteId, {
+      await api.streamAnalysis(targetNoteId, {
         signal: controller.signal,
-        onStatus: (event) => setStage(event.stage),
-        onComplete: (event) => setAnalysis(event.analysis),
+        onStatus: () => {},
+        onToken: (text: string) => {
+          setStreamingText((prev) => prev + text);
+        },
+        onComplete: (event) => {
+          setAnalysis(event.analysis);
+          setStreamingText("");
+        },
         onError: async ({ reason }) => {
-          const detail = await api.getNote(noteId).catch(() => null);
+          const detail = await api.getNote(targetNoteId).catch(() => null);
           if (detail) {
             setNote(detail.note);
             setAnalysis(detail.analysis);
@@ -95,8 +86,42 @@ export default function NoteDetailPage() {
           } else {
             setError(getFailureDisplay(reason).message);
           }
+          setStreamingText("");
         },
       });
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        setError(err instanceof ApiError ? err.message : "Could not analyze this note.");
+        setStreamingText("");
+      }
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    return () => streamAbort.current?.abort();
+  }, [load]);
+
+  useEffect(() => {
+    if (note && !analysis && !loading && !retrying && !error) {
+      if (note.analysis_job_id) {
+        void startStream(note.id);
+      }
+    }
+  }, [note, analysis, loading, retrying, error]);
+
+  async function handleRetryAnalysis() {
+    if (!noteId || retrying) return;
+
+    setRetrying(true);
+    setError(null);
+    setAnalysis(null);
+    setReview(null);
+
+    try {
+      const res = await api.reanalyzeNote(noteId);
+      setNote(res.note);
+      await startStream(noteId);
     } catch (err) {
       setError(
         err instanceof ApiError
@@ -127,6 +152,8 @@ export default function NoteDetailPage() {
     );
   }
 
+  const isStreaming = !analysis && (retrying || streamingText.length > 0 || !!note.analysis_job_id);
+
   return (
     <div className="page">
       <header className="page-header">
@@ -148,15 +175,8 @@ export default function NoteDetailPage() {
         <pre>{note.raw_text}</pre>
       </details>
 
-      {!analysis && (
-        retrying ? (
-          <AnalysisProgress stage={stage} />
-        ) : (
-          <ErrorState
-            message="This note has no analysis yet."
-            onRetry={handleRetryAnalysis}
-          />
-        )
+      {isStreaming && (
+        <StreamingAnalysis text={streamingText} />
       )}
 
       {analysis?.is_failed && (

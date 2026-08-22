@@ -1,5 +1,7 @@
 """Pydantic models for clinical notes."""
 
+import re
+
 from datetime import date, datetime
 from enum import Enum
 
@@ -15,8 +17,40 @@ class ReviewStatus(str, Enum):
     REVIEWED = "reviewed"
 
 
+# clinical notes are expected to run 100-3000 words.
+# We do not hard-reject notes below 100 words (a short but real note must
+# still be submittable) but we do cap the upper end well above the expected
+# range as a concrete guard against abuse and runaway LLM cost, rather than
+# relying on max_length (character count) alone as a word-count proxy.
+MAX_RAW_TEXT_WORDS = 6_000
+
+
+_EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+# Matches common US phone formats: 555-123-4567, (555) 123-4567,
+# 555.123.4567, 5551234567, optionally with a leading +1/1. Unanchored
+# (unlike the 9-digit check) so it also catches a phone number embedded
+# within other pseudonym text, matching the email check's behavior.
+_PHONE_PATTERN = re.compile(
+    r"\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}"
+)
+
+
+def _require_identifier(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("Identifier cannot be empty or whitespace only")
+    return value
+
+
 def _normalize_pseudonym(value: str | None) -> str | None:
-    """Strip optional pseudonyms and reject obvious 9-digit identifiers."""
+    """Strip optional pseudonyms and reject a few obvious identifier shapes.
+
+    This checks for a small set of unambiguous patterns (bare 9-digit
+    numbers, email addresses, phone numbers). It is a narrow guard against
+    a clinician accidentally pasting a real identifier here, not
+    comprehensive PHI detection -- a determined or careless entry (e.g. a
+    patient's actual full name typed as free text) will not be caught.
+    """
     if value is None:
         return None
 
@@ -24,11 +58,15 @@ def _normalize_pseudonym(value: str | None) -> str | None:
     if not value:
         return None
 
-    # Reject values that are clearly a bare or dash-separated 9-digit ID.
-    # This is not comprehensive PHI detection.
     compact = value.replace("-", "").replace(" ", "")
     if compact.isdigit() and len(compact) == 9:
         raise ValueError("pseudonym cannot be a 9-digit identifier")
+
+    if _EMAIL_PATTERN.search(value):
+        raise ValueError("pseudonym cannot contain an email address")
+
+    if _PHONE_PATTERN.search(value.strip()):
+        raise ValueError("pseudonym cannot be a phone number")
 
     return value
 
@@ -45,6 +83,12 @@ class NoteCreate(BaseModel):
     def validate_raw_text(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("raw_text cannot be empty or whitespace only")
+        word_count = len(value.split())
+        if word_count > MAX_RAW_TEXT_WORDS:
+            raise ValueError(
+                f"raw_text must not exceed {MAX_RAW_TEXT_WORDS} words "
+                f"(got {word_count})"
+            )
         # Preserve original clinical text, including surrounding whitespace.
         return value
 
@@ -72,10 +116,7 @@ class Note(BaseModel):
     @field_validator("id", "user_id")
     @classmethod
     def validate_identifier(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("Identifier cannot be empty or whitespace only")
-        return value
+        return _require_identifier(value)
 
     @field_validator("raw_text")
     @classmethod
@@ -113,10 +154,7 @@ class NoteListItem(BaseModel):
     @field_validator("id")
     @classmethod
     def validate_identifier(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("Identifier cannot be empty or whitespace only")
-        return value
+        return _require_identifier(value)
 
     @field_validator("pseudonym")
     @classmethod

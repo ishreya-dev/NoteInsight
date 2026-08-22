@@ -1,69 +1,23 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
-import { getFailureDisplay } from "../api/failure";
 import { ApiError } from "../api/errors";
 import { useAuth } from "../auth/useAuth";
-import type {
-  Analysis,
-  AsyncStatus,
-  Note,
-  NoteCreatePayload,
-} from "../api/types";
+import type { NoteCreatePayload } from "../api/types";
 import NoteForm from "../components/NoteForm";
-import AnalysisReview from "../components/AnalysisReview";
-import FailedAnalysisNotice from "../components/FailedAnalysisNotice";
 import ErrorState from "../components/ErrorState";
-import AnalysisProgress from "../components/AnalysisProgress";
-
-type AnalysisResult = {
-  note: Note;
-  analysis: Analysis | null;
-};
 
 export default function NewNotePage() {
   const { signOut } = useAuth();
   const navigate = useNavigate();
 
   const [status, setStatus] =
-    useState<AsyncStatus>("idle");
+    useState<"idle" | "loading" | "success" | "error">("idle");
 
   const [error, setError] =
     useState<string | null>(null);
 
-  const [result, setResult] =
-    useState<AnalysisResult | null>(null);
-  const [stage, setStage] = useState("preparing");
-  const streamAbort = useRef<AbortController | null>(null);
-
   useEffect(() => () => streamAbort.current?.abort(), []);
-
-  async function stream(note: Note) {
-    streamAbort.current?.abort();
-    const controller = new AbortController();
-    streamAbort.current = controller;
-    try {
-      await api.streamAnalysis(note.id, {
-        signal: controller.signal,
-        onStatus: (event) => setStage(event.stage),
-        onComplete: (event) => {
-          setResult({ note, analysis: event.analysis });
-          setStatus("success");
-        },
-        onError: async ({ reason }) => {
-          setError(getFailureDisplay(reason).message);
-          const detail = await api.getNote(note.id).catch(() => null);
-          setResult(detail ? { note: detail.note, analysis: detail.analysis } : { note, analysis: null });
-          setStatus("error");
-        },
-      });
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        setError(err instanceof ApiError ? err.message : "Could not analyze this note.");
-        setStatus("error");
-      }
-    }
-  }
 
   async function handleSubmit(
     payload: NoteCreatePayload,
@@ -73,36 +27,12 @@ export default function NewNotePage() {
 
     try {
       const res = await api.createNote(payload);
-      setResult({ note: res.note, analysis: null });
-      setStage("preparing");
-      void stream(res.note);
+      navigate(`/notes/${res.note.id}`);
     } catch (err) {
       setError(
         err instanceof ApiError
           ? err.message
-          : "Could not analyze this note. Please try again.",
-      );
-
-      setStatus("error");
-    }
-  }
-
-  async function handleRetryAnalysis() {
-    if (!result) return;
-
-    setStatus("loading");
-    setError(null);
-
-    try {
-      const res = await api.reanalyzeNote(result.note.id);
-      setResult({ note: res.note, analysis: null });
-      setStage("preparing");
-      void stream(res.note);
-    } catch (err) {
-      setError(
-        err instanceof ApiError
-          ? err.message
-          : "Retry failed. Please try again.",
+          : "Could not create this note. Please try again.",
       );
 
       setStatus("error");
@@ -110,8 +40,6 @@ export default function NewNotePage() {
   }
 
   function startNewNote() {
-    streamAbort.current?.abort();
-    setResult(null);
     setError(null);
     setStatus("idle");
   }
@@ -140,7 +68,7 @@ export default function NewNotePage() {
         </nav>
       </header>
 
-      {!result && (
+      {status !== "success" && (
         <>
           <NoteForm
             onSubmit={handleSubmit}
@@ -153,43 +81,13 @@ export default function NewNotePage() {
         </>
       )}
 
-      {result && isLoading && <AnalysisProgress stage={stage} />}
-
-      {result?.analysis?.is_failed && (
-        <>
-          <FailedAnalysisNotice
-            analysis={result.analysis}
-            onRetry={handleRetryAnalysis}
-            retrying={isLoading}
-          />
-
-          <button
-            type="button"
-            onClick={startNewNote}
-            disabled={isLoading}
-          >
-            Start a different note
-          </button>
-        </>
-      )}
-
-      {result?.analysis && !result.analysis.is_failed && (
-        <>
-          <AnalysisReview
-            analysis={result.analysis}
-            existingReview={null}
-            onSaved={() =>
-              navigate(`/notes/${result.note.id}`)
-            }
-          />
-
-          <button
-            type="button"
-            onClick={startNewNote}
-          >
-            Start a different note
-          </button>
-        </>
+      {status === "success" && (
+        <button
+          type="button"
+          onClick={startNewNote}
+        >
+          Start a different note
+        </button>
       )}
     </div>
   );

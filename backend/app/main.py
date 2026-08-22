@@ -1,9 +1,15 @@
 """Note Insight FastAPI application entrypoint."""
 
+from __future__ import annotations
+
 import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import get_settings
+from app.routers import analysis, auth, metrics, notes
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11,8 +17,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-from app.config import get_settings
-from app.routers import analysis, auth, notes
 
 settings = get_settings()
 
@@ -26,13 +30,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(auth.router)
 app.include_router(notes.router)
 app.include_router(analysis.router)
+app.include_router(metrics.router)
 
 
 @app.get("/health")

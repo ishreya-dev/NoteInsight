@@ -27,6 +27,15 @@ class ConditionReviewStatus(str, Enum):
     ADDED = "added"
 
 
+class AnalysisJobStatus(str, Enum):
+    """Lifecycle status of a background analysis job."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 def _require_non_whitespace(value: str) -> str:
     value = value.strip()
     if not value:
@@ -40,6 +49,19 @@ def _normalize_optional_text(value: str | None) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _require_evidence_quote(value: str) -> str:
+    # Do not strip the returned value: quotes must remain verbatim for
+    # traceability checks against the source note.
+    if not value.strip():
+        raise ValueError("evidence_quote must not be empty or whitespace only")
+    return value
+
+
+def _reject_duplicate_source_ids(source_ids: list[str]) -> None:
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("A source condition cannot be reviewed more than once")
 
 
 class ConditionFromModel(BaseModel):
@@ -59,10 +81,7 @@ class ConditionFromModel(BaseModel):
     @field_validator("evidence_quote")
     @classmethod
     def validate_evidence_quote(cls, value: str) -> str:
-        # Do not strip: quotes must remain verbatim for traceability checks.
-        if not value.strip():
-            raise ValueError("evidence_quote must not be empty or whitespace only")
-        return value
+        return _require_evidence_quote(value)
 
 
 class Condition(BaseModel):
@@ -86,9 +105,7 @@ class Condition(BaseModel):
     @field_validator("evidence_quote")
     @classmethod
     def validate_evidence_quote(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("evidence_quote must not be empty or whitespace only")
-        return value
+        return _require_evidence_quote(value)
 
 
 class DocumentationGapFromModel(BaseModel):
@@ -231,9 +248,7 @@ class ConditionReview(BaseModel):
     @field_validator("evidence_quote")
     @classmethod
     def validate_evidence_quote(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("evidence_quote must not be empty or whitespace only")
-        return value
+        return _require_evidence_quote(value)
 
     @model_validator(mode="after")
     def check_source_id_matches_status(self) -> "ConditionReview":
@@ -276,10 +291,7 @@ class ReviewCreate(BaseModel):
             for condition in self.conditions
             if condition.source_condition_id is not None
         ]
-        if len(source_ids) != len(set(source_ids)):
-            raise ValueError(
-                "A source condition cannot be reviewed more than once"
-            )
+        _reject_duplicate_source_ids(source_ids)
         return self
 
 
@@ -319,8 +331,5 @@ class Review(BaseModel):
             for condition in self.conditions
             if condition.source_condition_id is not None
         ]
-        if len(source_ids) != len(set(source_ids)):
-            raise ValueError(
-                "A source condition cannot be reviewed more than once"
-            )
+        _reject_duplicate_source_ids(source_ids)
         return self
