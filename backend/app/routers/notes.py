@@ -32,7 +32,8 @@ from app.services.gemini_client import (
     get_gemini_client,
     PROMPT_VERSION,
 )
-from app.services.analysis_jobs import stream_analysis_and_persist
+from app.services.analysis_jobs import _get_cached_result, stream_analysis_and_persist
+from app.services.firestore_codec import hash_note_text
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +297,32 @@ async def stream_analysis(
                 return
             if claimed == "claimed":
                 deadline_at = time.perf_counter() + settings.analysis_timeout_seconds
+
+                cache_key = "{}:{}:{}".format(
+                    hash_note_text(note.raw_text),
+                    PROMPT_VERSION,
+                    settings.gemini_model,
+                )
+                cached_result = await _get_cached_result(db, cache_key)
+                if cached_result is not None:
+                    analysis = Analysis(
+                        id=str(uuid.uuid4()),
+                        note_id=note.id,
+                        user_id=note.user_id,
+                        conditions=tuple(cached_result.conditions),
+                        gaps=tuple(cached_result.gaps),
+                        summary=cached_result.summary,
+                        model_version=cached_result.model_version,
+                        prompt_version=cached_result.prompt_version,
+                        is_failed=False,
+                        failure_reason=None,
+                    )
+                    await _persist_and_finish(db, note, job_id, analysis)
+                    yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
+                    yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
+                    log_stream_completed()
+                    return
+
                 yield _sse("status", {"stage": "preparing", "message": "Preparing clinical analysis..."})
                 try:
                     analysis = None

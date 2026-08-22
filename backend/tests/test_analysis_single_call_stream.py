@@ -1,4 +1,5 @@
 """Verification tests for the single-call streaming analysis flow."""
+import asyncio
 import json
 import os
 import sys
@@ -147,6 +148,97 @@ class TestSingleCallStreaming:
         client_with_stream.get("/notes/n1/analysis/stream")
         finish_calls = valid_db.finish_analysis_job.await_args_list
         assert any(c.kwargs.get("status") == "completed" for c in finish_calls)
+
+    def test_cache_hit_skips_gemini_and_emits_complete(self, valid_db, app):
+        """Requirement: an exact cache hit must skip Gemini and complete."""
+        cached = {
+            "conditions": [{
+                "condition_name": "Diabetes",
+                "evidence_quote": "Patient has diabetes",
+                "documentation_status": "well_documented",
+                "suggested_icd10": "E11.9",
+                "confidence": 0.9,
+            }],
+            "gaps": [],
+            "summary": "Patient has diabetes.",
+            "model_version": "cached-model",
+            "prompt_version": "v1",
+        }
+        valid_db.get_cached_analysis_result.return_value = cached
+
+        cache_gemini = FakeGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: cache_gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            complete = [data for etype, data in events if etype == "complete"]
+            assert len(complete) == 1
+            assert complete[0]["analysis"]["summary"] == "Patient has diabetes."
+            token_events = [data for etype, data in events if etype == "token"]
+            assert token_events == []
+
+        app.dependency_overrides.clear()
+        assert cache_gemini.call_count == 0
+        valid_db.persist_analysis_for_note.assert_awaited_once()
+        finish_calls = valid_db.finish_analysis_job.await_args_list
+        assert any(c.kwargs.get("status") == "completed" for c in finish_calls)
+
+    def test_identical_text_different_users_share_cache_key(self, valid_db, app):
+        """Requirement: identical note text from different users hits one entry."""
+        cached = {
+            "conditions": [{
+                "condition_name": "Diabetes",
+                "evidence_quote": "Patient has diabetes",
+                "documentation_status": "well_documented",
+                "suggested_icd10": "E11.9",
+                "confidence": 0.9,
+            }],
+            "gaps": [],
+            "summary": "Patient has diabetes.",
+            "model_version": "cached-model",
+            "prompt_version": "v1",
+        }
+        valid_db.get_cached_analysis_result.return_value = cached
+
+        user_a = AuthenticatedUser(uid="user-a", email="a@example.com")
+        user_b = AuthenticatedUser(uid="user-b", email="b@example.com")
+        note_a = make_note(note_id="na", user_id="user-a")
+        note_a.raw_text = "same text"
+        note_a.analysis_job_id = "job-a"
+        note_b = make_note(note_id="nb", user_id="user-b")
+        note_b.raw_text = "same text"
+        note_b.analysis_job_id = "job-b"
+
+        valid_db.get_note.side_effect = lambda *, note_id, user_id: {
+            ("na", "user-a"): note_a,
+            ("nb", "user-b"): note_b,
+        }[(note_id, user_id)]
+
+        gemini = FakeGemini()
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        app.dependency_overrides[get_current_user] = lambda: user_a
+        with TestClient(app) as c:
+            text_a = c.get(f"/notes/{note_a.id}/analysis/stream").text
+        app.dependency_overrides[get_current_user] = lambda: user_b
+        with TestClient(app) as c:
+            text_b = c.get(f"/notes/{note_b.id}/analysis/stream").text
+        app.dependency_overrides.clear()
+
+        cache_keys = [
+            c.args[0] for c in valid_db.get_cached_analysis_result.await_args_list
+        ]
+        assert cache_keys[0] == cache_keys[1]
+        assert "user-a" not in cache_keys[0]
+        assert "user-b" not in cache_keys[0]
+        for text in (text_a, text_b):
+            events = _parse_sse(text)
+            assert any(etype == "complete" for etype, _ in events)
+        assert gemini.call_count == 0
 
     def test_partial_output_not_marked_completed(self, valid_db, app):
         """Requirement: partial/invalid output is not marked completed."""
