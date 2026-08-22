@@ -1,138 +1,114 @@
-"""Clinician-correction metrics endpoint."""
+"""Aggregation logic for clinician-correction metrics."""
 
 from __future__ import annotations
 
-import logging
+from dataclasses import dataclass, field
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
-
-from app.dependencies import get_current_user
-from app.models.analysis import Analysis, Review
-from app.models.user import AuthenticatedUser
-from app.services.firestore_client import (
-    DocumentDataError,
-    FirestoreClient,
-    get_firestore_client,
-)
-from app.services.metrics import compute_condition_correction_metrics
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/metrics", tags=["metrics"])
+from app.models.analysis import Analysis, ConditionReviewStatus, Review
 
 
-class ConditionCorrectionMetric(BaseModel):
+@dataclass
+class ConditionCorrectionStats:
     """Correction counts for one AI-extracted condition."""
 
     condition_name: str
-    times_extracted: int
-    times_accepted: int
-    times_edited: int
-    times_rejected: int
-    correction_rate: float = Field(
-        description=(
-            "Fraction of extractions edited or rejected by the clinician."
-        )
-    )
+    times_extracted: int = 0
+    times_accepted: int = 0
+    times_edited: int = 0
+    times_rejected: int = 0
+
+    @property
+    def correction_rate(self) -> float:
+        """Return the fraction of extractions that were corrected."""
+        if self.times_extracted == 0:
+            return 0.0
+
+        corrected = self.times_edited + self.times_rejected
+        return corrected / self.times_extracted
 
 
-class ConditionAddedMetric(BaseModel):
+@dataclass
+class ConditionAddedStats:
     """Count of conditions added by the clinician."""
 
     condition_name: str
-    times_added: int
+    times_added: int = 0
 
 
-class MetricsResponse(BaseModel):
-    """Per-user clinician correction metrics."""
+@dataclass
+class MetricsSummary:
+    """Aggregated clinician-correction metrics."""
 
     reviews_analyzed: int
-    condition_corrections: list[ConditionCorrectionMetric] = Field(
+    condition_corrections: list[ConditionCorrectionStats] = field(
         default_factory=list
     )
-    conditions_added_by_clinician: list[ConditionAddedMetric] = Field(
+    conditions_added_by_clinician: list[ConditionAddedStats] = field(
         default_factory=list
     )
 
 
-@router.get("/conditions", response_model=MetricsResponse)
-async def get_condition_correction_metrics(
-    current_user: AuthenticatedUser = Depends(get_current_user),
-    db: FirestoreClient = Depends(get_firestore_client),
-) -> MetricsResponse:
-    """Return clinician correction metrics for the authenticated user."""
-    try:
-        reviews = await db.list_reviews_for_user(
-            user_id=current_user.uid
-        )
-    except DocumentDataError as exc:
-        logger.exception(
-            "Corrupt review data while computing metrics for user %s",
-            current_user.uid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Metrics could not be computed",
-        ) from exc
-    except Exception as exc:
-        logger.exception(
-            "Failed to load reviews for metrics for user %s",
-            current_user.uid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Metrics could not be computed",
-        ) from exc
+def compute_condition_correction_metrics(
+    reviews_with_analyses: list[tuple[Review, Analysis | None]],
+) -> MetricsSummary:
+    """Aggregate correction and addition metrics across reviews."""
+    corrections_by_name: dict[str, ConditionCorrectionStats] = {}
+    added_by_name: dict[str, ConditionAddedStats] = {}
+    reviews_analyzed = 0
 
-    reviews_with_analyses: list[tuple[Review, Analysis | None]] = []
+    for review, analysis in reviews_with_analyses:
+        if analysis is None:
+            continue
 
-    for review in reviews:
-        try:
-            analysis = await db.get_analysis(
-                analysis_id=review.analysis_id,
-                user_id=current_user.uid,
-            )
-        except DocumentDataError:
-            logger.exception(
-                "Corrupt analysis '%s' referenced by review '%s'; "
-                "excluding from metrics",
-                review.analysis_id,
-                review.id,
-            )
-            analysis = None
-        except Exception:
-            logger.exception(
-                "Failed to load analysis '%s' for metrics; "
-                "excluding from metrics",
-                review.analysis_id,
-            )
-            analysis = None
+        reviews_analyzed += 1
 
-        reviews_with_analyses.append((review, analysis))
+        original_conditions_by_id = {
+            condition.id: condition
+            for condition in analysis.conditions
+        }
 
-    summary = compute_condition_correction_metrics(
-        reviews_with_analyses
-    )
+        for condition_review in review.conditions:
+            if condition_review.status == ConditionReviewStatus.ADDED:
+                stats = added_by_name.setdefault(
+                    condition_review.condition_name,
+                    ConditionAddedStats(
+                        condition_name=condition_review.condition_name
+                    ),
+                )
+                stats.times_added += 1
+                continue
 
-    return MetricsResponse(
-        reviews_analyzed=summary.reviews_analyzed,
-        condition_corrections=[
-            ConditionCorrectionMetric(
-                condition_name=stats.condition_name,
-                times_extracted=stats.times_extracted,
-                times_accepted=stats.times_accepted,
-                times_edited=stats.times_edited,
-                times_rejected=stats.times_rejected,
-                correction_rate=stats.correction_rate,
+            original = original_conditions_by_id.get(
+                condition_review.source_condition_id
             )
-            for stats in summary.condition_corrections
-        ],
-        conditions_added_by_clinician=[
-            ConditionAddedMetric(
-                condition_name=stats.condition_name,
-                times_added=stats.times_added,
+
+            if original is None:
+                continue
+
+            stats = corrections_by_name.setdefault(
+                original.condition_name,
+                ConditionCorrectionStats(
+                    condition_name=original.condition_name
+                ),
             )
-            for stats in summary.conditions_added_by_clinician
-        ],
+
+            stats.times_extracted += 1
+
+            if condition_review.status == ConditionReviewStatus.ACCEPTED:
+                stats.times_accepted += 1
+            elif condition_review.status == ConditionReviewStatus.EDITED:
+                stats.times_edited += 1
+            elif condition_review.status == ConditionReviewStatus.REJECTED:
+                stats.times_rejected += 1
+
+    return MetricsSummary(
+        reviews_analyzed=reviews_analyzed,
+        condition_corrections=sorted(
+            corrections_by_name.values(),
+            key=lambda stats: stats.condition_name,
+        ),
+        conditions_added_by_clinician=sorted(
+            added_by_name.values(),
+            key=lambda stats: stats.condition_name,
+        ),
     )
