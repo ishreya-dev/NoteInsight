@@ -8,7 +8,6 @@ import AnalysisReview from "../components/AnalysisReview";
 import FailedAnalysisNotice from "../components/FailedAnalysisNotice";
 import LoadingState from "../components/LoadingState";
 import ErrorState from "../components/ErrorState";
-import StreamingAnalysis from "../components/StreamingAnalysis";
 
 export default function NoteDetailPage() {
   const { noteId } = useParams<{ noteId: string }>();
@@ -162,6 +161,13 @@ export default function NoteDetailPage() {
         <nav>
           <button
             type="button"
+            onClick={() => navigate("/notes/new")}
+          >
+            New Note
+          </button>
+
+          <button
+            type="button"
             onClick={() => navigate("/history")}
           >
             Back to history
@@ -175,8 +181,14 @@ export default function NoteDetailPage() {
         <pre>{note.raw_text}</pre>
       </details>
 
-      {isStreaming && (
-        <StreamingAnalysis text={streamingText} />
+      {(analysis || isStreaming) && !analysis?.is_failed && (
+        <AnalysisReview
+          analysis={analysis ?? null}
+          existingReview={review}
+          onSaved={setReview}
+          streamingText={isStreaming ? streamingText : undefined}
+          isStreaming={isStreaming}
+        />
       )}
 
       {analysis?.is_failed && (
@@ -184,14 +196,6 @@ export default function NoteDetailPage() {
           analysis={analysis}
           onRetry={handleRetryAnalysis}
           retrying={retrying}
-        />
-      )}
-
-      {analysis && !analysis.is_failed && (
-        <AnalysisReview
-          analysis={analysis}
-          existingReview={review}
-          onSaved={setReview}
         />
       )}
     </div>

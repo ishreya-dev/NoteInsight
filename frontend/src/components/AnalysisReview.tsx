@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Analysis, DocumentationStatus, Review } from "../api/types";
 import { api } from "../api/client";
 import { ApiError } from "../api/errors";
@@ -7,17 +7,67 @@ import ConditionCard from "./ConditionCard";
 import GapsList from "./GapsList";
 import ErrorState from "./ErrorState";
 
+const MESSAGES = ["thinking", "Analyzing note", "Preparing summary"] as const;
+
 interface AnalysisReviewProps {
-  analysis: Analysis;
+  analysis: Analysis | null;
   existingReview: Review | null;
   onSaved: (review: Review) => void;
+  streamingText?: string;
+  isStreaming?: boolean;
 }
 
 export default function AnalysisReview({
   analysis,
   existingReview,
   onSaved,
+  streamingText,
+  isStreaming,
 }: AnalysisReviewProps) {
+  const streaming = isStreaming ?? (!analysis && !!streamingText);
+  const [dotCount, setDotCount] = useState(0);
+  const [messageIndex, setMessageIndex] = useState(0);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const isPreparing = streaming && !streamingText;
+
+  useEffect(() => {
+    if (!isPreparing) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      return;
+    }
+
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+
+    if (prefersReducedMotion) {
+      setDotCount(0);
+      setMessageIndex(0);
+      return;
+    }
+
+    intervalRef.current = setInterval(() => {
+      setDotCount((prev) => {
+        if (prev === 2) {
+          setMessageIndex((mi) => (mi + 1) % MESSAGES.length);
+          return 0;
+        }
+        return prev + 1;
+      });
+    }, 500);
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [isPreparing]);
+
   const {
     reviewable,
     added,
@@ -29,7 +79,7 @@ export default function AnalysisReview({
     removeAddedCondition,
     buildPayload,
     hasIncompleteAddedCondition,
-  } = useReviewState(analysis.conditions, existingReview);
+  } = useReviewState(analysis?.conditions ?? [], existingReview);
 
   const [reviewerNotes, setReviewerNotes] = useState(
     existingReview?.reviewer_notes ?? ""
@@ -39,13 +89,14 @@ export default function AnalysisReview({
   const [savedAt, setSavedAt] = useState<string | null>(null);
 
   const quoteVerifiedById = new Map(
-    analysis.conditions.map((c) => [c.id, c.quote_verified])
+    analysis?.conditions.map((c) => [c.id, c.quote_verified]) ?? []
   );
   const confidenceById = new Map(
-    analysis.conditions.map((c) => [c.id, c.confidence])
+    analysis?.conditions.map((c) => [c.id, c.confidence]) ?? []
   );
 
   async function handleSave() {
+    if (!analysis) return;
     setSaving(true);
     setSaveError(null);
     try {
@@ -71,10 +122,20 @@ export default function AnalysisReview({
     <div className="analysis-review">
       <section className="analysis-summary">
         <h2>Summary</h2>
-        <p>{analysis.summary}</p>
+        {isPreparing ? (
+          <p>
+            {MESSAGES[messageIndex]} {".".repeat(dotCount + 1).split("").join(" ")}
+          </p>
+        ) : streaming ? (
+          <p>{streamingText}</p>
+        ) : (
+          <p>{analysis?.summary}</p>
+        )}
       </section>
 
-      <section className="analysis-conditions">
+      {!streaming && (
+        <div key={analysis?.id}>
+          <section className="analysis-conditions">
         <h2>Conditions ({reviewable.length})</h2>
         {reviewable.map((c) => (
           <ConditionCard
@@ -158,7 +219,7 @@ export default function AnalysisReview({
 
       <section className="analysis-gaps">
         <h2>Documentation gaps</h2>
-        <GapsList gaps={analysis.gaps} />
+        <GapsList gaps={analysis!.gaps} />
       </section>
 
       <section className="analysis-notes">
@@ -173,14 +234,20 @@ export default function AnalysisReview({
 
       {saveError && <ErrorState message={saveError} onRetry={handleSave} />}
 
-      <div className="analysis-review-footer">
-        {savedAt && !saving && (
-          <span className="save-confirmation">Saved at {savedAt}</span>
-        )}
-        <button type="button" onClick={handleSave} disabled={saving || hasIncompleteAddedCondition}>
-          {saving ? "Saving…" : "Save review"}
-        </button>
-      </div>
+          <div className="analysis-review-footer">
+            {savedAt && !saving && (
+              <span className="save-confirmation">Saved at {savedAt}</span>
+            )}
+            <button 
+              type="button" 
+              onClick={handleSave} 
+              disabled={saving || hasIncompleteAddedCondition || streaming}
+            >
+              {saving ? "Saving…" : "Save review"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
