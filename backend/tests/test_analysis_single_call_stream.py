@@ -11,10 +11,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import get_current_user, get_firestore_client
-from app.models.analysis import DocumentationStatus
+from app.models.analysis import Condition, DocumentationStatus
 from app.models.note import Note
 from app.models.user import AuthenticatedUser
-from app.services.gemini_client import GeminiAnalysisError, get_gemini_client
+from app.services.gemini_client import GeminiAnalysisError, PROMPT_VERSION, get_gemini_client
+from app.services.similarity import build_shingles, tokenize
 from app.config import get_settings
 from tests.conftest import TEST_USER, make_analysis, make_note
 
@@ -270,3 +271,44 @@ class TestSingleCallStreaming:
 
         app.dependency_overrides.clear()
         assert bad_gemini.call_count == 1
+
+    def test_similar_cache_hit_skips_gemini_and_emits_complete(self, valid_db, app):
+        """Requirement: a safe similar hit (exact miss) skips Gemini on SSE."""
+        note_text = "Patient has Type 2 diabetes, controlled on metformin."
+        quote = "Type 2 diabetes"
+        cond = Condition(
+            id="c1",
+            condition_name="Type 2 diabetes mellitus",
+            evidence_quote=quote,
+            documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+            suggested_icd10="E11.9",
+            confidence=0.9,
+            quote_verified=True,
+        )
+        similar = {
+            "shingles": list(build_shingles(tokenize(note_text))),
+            "conditions": [cond.model_dump(mode="json", exclude={"id"})],
+            "gaps": [],
+            "summary": "Patient has diabetes.",
+            "model_version": "cached-model",
+            "prompt_version": PROMPT_VERSION,
+        }
+        valid_db.get_cached_analysis_result.return_value = None
+        valid_db.find_similar_cached_results = AsyncMock(return_value=[similar])
+
+        gemini = FakeGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+
+        complete = [data for etype, data in events if etype == "complete"]
+        assert len(complete) == 1
+        assert complete[0]["analysis"]["summary"] == "Patient has diabetes."
+        assert gemini.call_count == 0
+        valid_db.persist_analysis_for_note.assert_awaited_once()
+        finish_calls = valid_db.finish_analysis_job.await_args_list
+        assert any(c.kwargs.get("status") == "completed" for c in finish_calls)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -319,3 +319,197 @@ async def test_get_analysis_returns_none_for_other_user() -> None:
     assert owned is not None
     assert owned.id == analysis.id
     assert owned.user_id == owner_id
+
+
+def _firestore_client_with_doc_ref() -> tuple[FirestoreClient, MagicMock]:
+    doc_ref = MagicMock()
+    doc_ref.create = AsyncMock()
+    client = FirestoreClient.__new__(FirestoreClient)
+    client._db = MagicMock()
+    client._db.collection.return_value.document.return_value = doc_ref
+    return client, doc_ref
+
+
+@pytest.mark.asyncio
+async def test_cache_analysis_result_stores_buckets_and_signature() -> None:
+    client, doc_ref = _firestore_client_with_doc_ref()
+    await client.cache_analysis_result(
+        "hash1",
+        {"summary": "x", "conditions": []},
+        buckets=["lsh:0:aa", "lsh:1:bb"],
+        signature=[1, 2, 3],
+    )
+    assert doc_ref.create.await_args is not None
+    saved = doc_ref.create.call_args.args[0]
+    assert saved["buckets"] == ["lsh:0:aa", "lsh:1:bb"]
+    assert saved["signature"] == [1, 2, 3]
+    assert saved["summary"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_cache_analysis_result_without_similarity_metadata_is_unchanged() -> None:
+    client, doc_ref = _firestore_client_with_doc_ref()
+    await client.cache_analysis_result("hash1", {"summary": "x"})
+    saved = doc_ref.create.call_args.args[0]
+    assert "buckets" not in saved
+    assert "signature" not in saved
+    assert "shingles" not in saved
+    assert "expires_at" in saved
+
+
+@pytest.mark.asyncio
+async def test_cache_analysis_result_stores_expires_at() -> None:
+    from datetime import datetime, timezone
+
+    client, doc_ref = _firestore_client_with_doc_ref()
+    await client.cache_analysis_result("hash1", {"summary": "x"})
+    saved = doc_ref.create.call_args.args[0]
+
+    expires = saved["expires_at"]
+    assert isinstance(expires, datetime)
+    assert expires.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_cache_analysis_result_expires_at_is_about_15_days() -> None:
+    from datetime import datetime, timezone
+
+    before = datetime.now(timezone.utc)
+    client, doc_ref = _firestore_client_with_doc_ref()
+    await client.cache_analysis_result("hash1", {"summary": "x"})
+    after = datetime.now(timezone.utc)
+
+    expires = doc_ref.create.call_args.args[0]["expires_at"]
+    low = before + timedelta(days=15)
+    high = after + timedelta(days=15)
+    assert low <= expires <= high
+
+
+@pytest.mark.asyncio
+async def test_cache_analysis_result_keeps_existing_fields_with_expiry() -> None:
+    client, doc_ref = _firestore_client_with_doc_ref()
+    await client.cache_analysis_result(
+        "hash1",
+        {"summary": "x"},
+        buckets=["lsh:0:aa"],
+        signature=[1, 2, 3],
+        shingles=["a b c"],
+    )
+    saved = doc_ref.create.call_args.args[0]
+    assert saved["summary"] == "x"
+    assert saved["buckets"] == ["lsh:0:aa"]
+    assert saved["signature"] == [1, 2, 3]
+    assert saved["shingles"] == ["a b c"]
+    assert "expires_at" in saved
+
+
+@pytest.mark.asyncio
+async def test_cache_analysis_result_stores_shingles_for_lexical_similarity() -> None:
+    from app.services.similarity import build_shingles, tokenize
+
+    client, doc_ref = _firestore_client_with_doc_ref()
+    shingles = list(build_shingles(tokenize("Patient has type 2 diabetes mellitus")))
+    await client.cache_analysis_result(
+        "hash1",
+        {"summary": "x"},
+        buckets=["lsh:0:aa"],
+        signature=[1, 2, 3],
+        shingles=shingles,
+    )
+    saved = doc_ref.create.call_args.args[0]
+    assert saved["shingles"] == shingles
+    assert "2 diabetes mellitus" in saved["shingles"]
+
+
+@pytest.mark.asyncio
+async def test_cached_shingles_enable_accurate_jaccard() -> None:
+    from app.services.similarity import build_shingles, jaccard, tokenize
+
+    note_a = "patient is a 64 year old male with type 2 diabetes mellitus"
+    note_b = "patient is a 64 year old female with type 2 diabetes mellitus"
+    cached = {"shingles": list(build_shingles(tokenize(note_a)))}
+    score = jaccard(
+        build_shingles(tokenize(note_b)),
+        frozenset(cached["shingles"]),
+    )
+    assert 0.0 < score < 1.0
+
+
+@pytest.mark.asyncio
+async def test_get_cached_analysis_result_ignores_similarity_metadata() -> None:
+    snapshot = MagicMock()
+    snapshot.exists = True
+    snapshot.to_dict.return_value = {
+        "summary": "x",
+        "buckets": ["lsh:0:aa"],
+        "signature": [1, 2, 3],
+    }
+    client = _firestore_client_with_snapshot(snapshot)
+    result = await client.get_cached_analysis_result("hash1")
+    assert result == {"summary": "x", "buckets": ["lsh:0:aa"], "signature": [1, 2, 3]}
+    client._db.collection.assert_called_once_with("analysis_cache")
+
+
+def _query_mock(returned_snapshots: list[MagicMock]) -> MagicMock:
+    query = MagicMock()
+    query.where.return_value = query
+    query.limit.return_value = query
+    query.get = AsyncMock(return_value=returned_snapshots)
+    return query
+
+
+@pytest.mark.asyncio
+async def test_find_similar_cached_results_returns_matching_candidates() -> None:
+    snap_a = MagicMock()
+    snap_a.id = "a"
+    snap_a.to_dict.return_value = {"summary": "a"}
+    snap_b = MagicMock()
+    snap_b.id = "b"
+    snap_b.to_dict.return_value = {"summary": "b"}
+    query = _query_mock([snap_a, snap_b])
+
+    client = FirestoreClient.__new__(FirestoreClient)
+    client._db = MagicMock()
+    client._db.collection.return_value = query
+
+    results = await client.find_similar_cached_results(
+        ["lsh:0:x", "lsh:1:y"], limit=5
+    )
+
+    assert [r["summary"] for r in results] == ["a", "b"]
+    query.where.assert_called_once()
+    assert query.where.call_args.args[0] == "buckets"
+    assert query.where.call_args.args[1] == "array_contains_any"
+    assert query.where.call_args.args[2] == ["lsh:0:x", "lsh:1:y"]
+    query.limit.assert_called_once_with(5)
+
+
+@pytest.mark.asyncio
+async def test_find_similar_cached_results_empty_buckets_does_not_query() -> None:
+    client = FirestoreClient.__new__(FirestoreClient)
+    client._db = MagicMock()
+    assert await client.find_similar_cached_results([]) == []
+    client._db.collection.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_find_similar_cached_results_dedupes_chunks_and_caps() -> None:
+    snap_a = MagicMock()
+    snap_a.id = "a"
+    snap_a.to_dict.return_value = {"buckets": ["x"]}
+    snap_b = MagicMock()
+    snap_b.id = "b"
+    snap_b.to_dict.return_value = {"buckets": ["y"]}
+    query = _query_mock([snap_a, snap_b])
+
+    client = FirestoreClient.__new__(FirestoreClient)
+    client._db = MagicMock()
+    client._db.collection.return_value = query
+
+    many_buckets = [f"b{i}" for i in range(35)]
+    results = await client.find_similar_cached_results(many_buckets, limit=10)
+
+    assert len(results) == 2
+    assert query.get.call_count == 2
+    chunk_sizes = [c.args[2] for c in query.where.call_args_list]
+    assert all(len(chunk) <= 30 for chunk in chunk_sizes)

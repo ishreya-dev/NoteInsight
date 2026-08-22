@@ -16,6 +16,11 @@ from app.services.firestore_client import (
     FirestoreClient,
 )
 from app.services.firestore_codec import hash_note_text
+from app.services.similarity import MinHash, build_shingles, compute_buckets, tokenize
+from app.services.similarity_cache import (
+    DEFAULT_SIMILARITY_THRESHOLD,
+    select_best_similar_candidate,
+)
 from app.services.gemini_client import (
     AnalysisResult,
     GeminiAnalysisError,
@@ -64,7 +69,7 @@ async def stream_analysis_and_persist(
             normalized = _normalize_response_payload(parsed_obj)
             parsed = GeminiRawResponse.model_validate(normalized)
             result = _analysis_result_from_parsed(parsed, note.raw_text, settings)
-            await _store_cached_result(db, cache_key, result)
+            await _store_cached_result(db, cache_key, result, note_text=note.raw_text)
     except GeminiAnalysisError:
         raise
     except Exception as exc:
@@ -158,8 +163,18 @@ async def _analyze_and_persist(
     try:
         result = await _get_cached_result(db, cache_key)
         if result is None:
+            similar = await find_similar_cached_analysis(db, note.raw_text)
+            if similar is not None:
+                try:
+                    result = _parse_cached_result(similar)
+                except (KeyError, TypeError, ValueError):
+                    logger.exception(
+                        "Corrupt similar-cache entry for note %s; ignoring", note.id
+                    )
+                    result = None
+        if result is None:
             result = await gemini.analyze_note(note.raw_text)
-            await _store_cached_result(db, cache_key, result)
+            await _store_cached_result(db, cache_key, result, note_text=note.raw_text)
 
         analysis = Analysis(
             id=analysis_id,
@@ -238,6 +253,26 @@ def _create_failed_analysis(
     )
 
 
+def _parse_cached_result(cached: dict) -> AnalysisResult:
+    """Build an ``AnalysisResult`` from a stored cache payload dict.
+
+    Shared by the exact and similar cache paths; the candidate payload from a
+    near-duplicate lookup has the same shape as an exact-cache entry.
+    """
+    conditions = [
+        Condition(id=str(uuid.uuid4()), **condition)
+        for condition in cached["conditions"]
+    ]
+    gaps = [DocumentationGap(**gap) for gap in cached["gaps"]]
+    return AnalysisResult(
+        conditions=conditions,
+        gaps=gaps,
+        summary=cached["summary"],
+        model_version=cached["model_version"],
+        prompt_version=cached["prompt_version"],
+    )
+
+
 async def _get_cached_result(
     db: FirestoreClient,
     cache_key: str,
@@ -257,18 +292,7 @@ async def _get_cached_result(
         return None
 
     try:
-        conditions = [
-            Condition(id=str(uuid.uuid4()), **condition)
-            for condition in cached["conditions"]
-        ]
-        gaps = [DocumentationGap(**gap) for gap in cached["gaps"]]
-        return AnalysisResult(
-            conditions=conditions,
-            gaps=gaps,
-            summary=cached["summary"],
-            model_version=cached["model_version"],
-            prompt_version=cached["prompt_version"],
-        )
+        return _parse_cached_result(cached)
     except (KeyError, TypeError, ValueError):
         logger.exception(
             "Corrupt analysis cache entry for key %s; ignoring", cache_key
@@ -280,8 +304,15 @@ async def _store_cached_result(
     db: FirestoreClient,
     cache_key: str,
     result: AnalysisResult,
+    note_text: str,
 ) -> None:
-    """Best-effort write of a fresh Gemini result to the shared cache."""
+    """Best-effort write of a fresh Gemini result to the shared cache.
+
+    Stores the LSH buckets, MinHash signature, and word-shingle set derived
+    from the note text so a future lookup can return this entry as a
+    near-duplicate candidate and later compute an accurate lexical (Jaccard)
+    similarity rather than relying on the approximate MinHash signature.
+    """
     payload = {
         "conditions": [
             condition.model_dump(mode="json", exclude={"id"})
@@ -292,8 +323,17 @@ async def _store_cached_result(
         "model_version": result.model_version,
         "prompt_version": result.prompt_version,
     }
+    shingles = build_shingles(tokenize(note_text))
+    signature = MinHash().signature(shingles)
+    buckets = compute_buckets(note_text)
     try:
-        await db.cache_analysis_result(cache_key, payload)
+        await db.cache_analysis_result(
+            cache_key,
+            payload,
+            buckets=buckets,
+            signature=list(signature),
+            shingles=list(shingles),
+        )
     except Exception:
         logger.exception("Failed to write analysis cache for key %s", cache_key)
 
@@ -323,3 +363,22 @@ def _analysis_result_from_parsed(
         model_version=settings.gemini_model,
         prompt_version=PROMPT_VERSION,
     )
+
+
+async def find_similar_cached_analysis(
+    db: FirestoreClient,
+    note_text: str,
+    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+) -> dict[str, Any] | None:
+    """Return a safely reusable near-duplicate cached analysis, or ``None``.
+
+    Service-layer orchestration of the similarity cache: derive LSH buckets
+    from the note, fetch candidate entries from the global ``analysis_cache``
+    collection, then apply the conservative safety decision. The cache stays
+    global (no user/note scoping). When no candidate passes every safety
+    check, returns ``None`` so the caller can fall back to Gemini. The exact
+    cache lookup is handled separately and is not performed here.
+    """
+    buckets = compute_buckets(note_text)
+    candidates = await db.find_similar_cached_results(buckets)
+    return select_best_similar_candidate(note_text, candidates, threshold)

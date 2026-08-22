@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from google.cloud import firestore
@@ -32,6 +33,15 @@ _REVIEWS_COLLECTION = "reviews"
 _ANALYSIS_JOBS_COLLECTION = "analysis_jobs"
 _ANALYSIS_CACHE_COLLECTION = "analysis_cache"
 _RATE_LIMITS_COLLECTION = "rate_limits"
+
+# Maximum number of candidate cache entries returned by a similarity lookup.
+_SIMILAR_CANDIDATE_LIMIT = 10
+# Firestore `array_contains_any` accepts at most this many values per query.
+_MAX_CONTAINS_ANY = 30
+# Global analysis cache entries expire this many days after creation. The
+# actual deletion is handled by a Firestore TTL policy on the `expires_at`
+# field; this module only stamps that timestamp when writing entries.
+_ANALYSIS_CACHE_TTL_DAYS = 15
 
 
 class FirestoreClient:
@@ -393,6 +403,9 @@ class FirestoreClient:
         self,
         note_text_hash: str,
         result_payload: dict[str, Any],
+        buckets: list[str] | None = None,
+        signature: list[int] | None = None,
+        shingles: list[str] | None = None,
     ) -> None:
         """Best-effort write of a Gemini result payload to the shared cache.
 
@@ -400,15 +413,72 @@ class FirestoreClient:
         never overwrites another; the first successful result wins and
         later callers simply reuse it. A create conflict is expected and
         ignored, not an error.
+
+        When provided, ``buckets`` (LSH band ids) and ``signature`` (the
+        MinHash signature) are stored alongside the result so the entry can
+        later be returned as a near-duplicate candidate. ``shingles`` stores
+        the cached note's word-shingle set so a future lookup can compute an
+        accurate lexical (Jaccard) similarity rather than relying on the
+        approximate MinHash signature. The cache remains global: no user id
+        or note id is ever stored here.
         """
+        payload = dict(result_payload)
+        if buckets is not None:
+            payload["buckets"] = list(buckets)
+        if signature is not None:
+            payload["signature"] = list(signature)
+        if shingles is not None:
+            payload["shingles"] = list(shingles)
+        payload["expires_at"] = datetime.now(timezone.utc) + timedelta(
+            days=_ANALYSIS_CACHE_TTL_DAYS
+        )
+
         cache_ref = self._db.collection(_ANALYSIS_CACHE_COLLECTION).document(
             note_text_hash
         )
         try:
-            await cache_ref.create(result_payload)
+            await cache_ref.create(payload)
         except Exception as exc:
             if not is_already_exists(exc):
                 raise
+
+    async def find_similar_cached_results(
+        self,
+        buckets: list[str],
+        limit: int = _SIMILAR_CANDIDATE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded set of near-duplicate candidate cache entries.
+
+        Looks up the global ``analysis_cache`` collection for entries whose
+        stored LSH ``buckets`` intersect the supplied candidate ``buckets``.
+        This is only a coarse candidate filter; the caller is responsible for
+        exact re-scoring (e.g. Jaccard over signatures) and evidence
+        validation. No user id or note id is used, so the cache stays global.
+
+        The result is capped at ``limit`` entries and de-duplicated by
+        document id when the bucket list must be split across multiple
+        ``array_contains_any`` queries (Firestore allows at most
+        ``_MAX_CONTAINS_ANY`` values per query).
+        """
+        bucket_list = list(buckets)
+        if not bucket_list:
+            return []
+
+        results: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(bucket_list), _MAX_CONTAINS_ANY):
+            chunk = bucket_list[start : start + _MAX_CONTAINS_ANY]
+            snapshot = await (
+                self._db.collection(_ANALYSIS_CACHE_COLLECTION)
+                .where("buckets", "array_contains_any", chunk)
+                .limit(limit)
+                .get()
+            )
+            for doc in snapshot:
+                if doc.id not in results:
+                    results[doc.id] = doc.to_dict() or {}
+                if len(results) >= limit:
+                    return list(results.values())
+        return list(results.values())
 
     async def consume_rate_limit_slot(
         self,

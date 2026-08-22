@@ -32,7 +32,12 @@ from app.services.gemini_client import (
     get_gemini_client,
     PROMPT_VERSION,
 )
-from app.services.analysis_jobs import _get_cached_result, stream_analysis_and_persist
+from app.services.analysis_jobs import (
+    _get_cached_result,
+    _parse_cached_result,
+    find_similar_cached_analysis,
+    stream_analysis_and_persist,
+)
 from app.services.firestore_codec import hash_note_text
 
 logger = logging.getLogger(__name__)
@@ -322,6 +327,31 @@ async def stream_analysis(
                     yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
                     log_stream_completed()
                     return
+
+                similar_result = await find_similar_cached_analysis(db, note.raw_text)
+                if similar_result is not None:
+                    try:
+                        parsed_similar = _parse_cached_result(similar_result)
+                    except (KeyError, TypeError, ValueError):
+                        parsed_similar = None
+                    if parsed_similar is not None:
+                        analysis = Analysis(
+                            id=str(uuid.uuid4()),
+                            note_id=note.id,
+                            user_id=note.user_id,
+                            conditions=tuple(parsed_similar.conditions),
+                            gaps=tuple(parsed_similar.gaps),
+                            summary=parsed_similar.summary,
+                            model_version=parsed_similar.model_version,
+                            prompt_version=parsed_similar.prompt_version,
+                            is_failed=False,
+                            failure_reason=None,
+                        )
+                        await _persist_and_finish(db, note, job_id, analysis)
+                        yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
+                        yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
+                        log_stream_completed()
+                        return
 
                 yield _sse("status", {"stage": "preparing", "message": "Preparing clinical analysis..."})
                 try:
