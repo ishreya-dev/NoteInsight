@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
 from app.dependencies import enforce_analysis_rate_limit, get_current_user
-from app.models.analysis import Analysis, Review
+from app.models.analysis import Analysis, AnalysisJobStatus, Review
 from app.models.note import Note, NoteCreate, NoteListItem
 from app.models.user import AuthenticatedUser
 from app.services.analysis_jobs import _run_analysis_job
@@ -27,6 +27,7 @@ from app.services.firestore_client import (
     get_firestore_client,
 )
 from app.services.gemini_client import (
+    GeminiAnalysisError,
     GeminiClient,
     get_gemini_client,
     PROMPT_VERSION,
