@@ -307,7 +307,7 @@ def _analysis_result_from_parsed(
             documentation_status=condition.documentation_status,
             suggested_icd10=condition.suggested_icd10,
             confidence=condition.confidence,
-            quote_verified=verify_evidence_quote(condition.evidence_quote, note_text),
+             quote_verified=verify_evidence_quote(condition.evidence_quote, note_text),
         )
         for condition in parsed.conditions
     ]

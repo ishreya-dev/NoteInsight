@@ -9,6 +9,7 @@ import re
 import time
 import unicodedata
 import uuid
+from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
@@ -337,120 +338,6 @@ class GeminiClient:
                     usage_metadata=_response_usage_metadata.get(),
                 )
                 return result
-
-            except (ValidationError, ValueError) as exc:
-                last_error = exc
-                last_failure_reason = "invalid_output"
-                logger.warning(
-                    "Gemini output validation failed on attempt %d/%d model=%s "
-                    "error=%s",
-                    attempt,
-                    _MAX_ATTEMPTS,
-                    self._settings.gemini_model,
-                    _safe_error_summary(exc),
-                )
-                if attempt < _MAX_ATTEMPTS:
-                    request_contents = build_validation_retry_prompt(
-                        base_prompt,
-                        exc,
-                    )
-
-            except (TypeError, AttributeError) as exc:
-                logger.exception(
-                    "Unexpected Gemini client error on attempt %d/%d model=%s",
-                    attempt,
-                    _MAX_ATTEMPTS,
-                    self._settings.gemini_model,
-                )
-                raise GeminiAnalysisError(
-                    "Gemini analysis failed due to an internal error",
-                    failure_reason="internal_error",
-                ) from exc
-
-            except Exception as exc:
-                last_error = exc
-                last_failure_reason = _failure_reason_for_exception(exc)
-                logger.warning(
-                    "Gemini API request failed on attempt %d/%d model=%s "
-                    "error_type=%s error_message=%s status_code=%s",
-                    attempt,
-                    _MAX_ATTEMPTS,
-                    self._settings.gemini_model,
-                    type(exc).__name__,
-                    str(exc)[:500],
-                    _status_code_from_exception(exc),
-                )
-                if attempt < _MAX_ATTEMPTS:
-                    request_contents = base_prompt
-                    if _is_resource_exhausted(exc):
-                        retry_delay, delay_source = _retry_delay_from_exception(exc)
-                        logger.info(
-                            "gemini_retry_scheduled attempt=%d error_type=429 "
-                            "retry_delay_ms=%d delay_source=%s",
-                            attempt,
-                            round(retry_delay * 1000),
-                            delay_source,
-                        )
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        logger.info(
-                            "gemini_retry_scheduled attempt=%d error_type=%s "
-                            "retry_delay_ms=%d delay_source=fallback",
-                            attempt,
-                            type(exc).__name__,
-                            round(_429_FALLBACK_DELAY_SECONDS * 1000),
-                        )
-                        await asyncio.sleep(_429_FALLBACK_DELAY_SECONDS)
-            finally:
-                processing_started_at = _response_processing_started_at.get()
-                if processing_started_at is not None:
-                    logger.info(
-                        "gemini_response_processing_completed attempt=%d "
-                        "duration_ms=%d",
-                        attempt,
-                        round((time.perf_counter() - processing_started_at) * 1000),
-                    )
-                _response_processing_started_at.reset(processing_token)
-                _response_usage_metadata.reset(usage_token)
-                logger.info(
-                    "gemini_attempt_completed attempt=%d duration_ms=%d",
-                    attempt,
-                    round((time.perf_counter() - attempt_started_at) * 1000),
-                )
-
-        raise GeminiAnalysisError(
-            f"Gemini did not return valid output after {_MAX_ATTEMPTS} attempts",
-            failure_reason=last_failure_reason,
-        ) from last_error
-
-    async def stream_analyze_note(
-        self, note_text: str
-    ) -> AsyncIterator[str]:
-        """Yield raw text chunks from Gemini for incremental streaming.
-
-        Accumulated text is not validated here; the caller is responsible
-        for final validation and persistence.
-        """
-        if not note_text.strip():
-            raise GeminiAnalysisError("Clinical note text is empty")
-
-        base_prompt = self._prompt_template.replace(
-            _NOTE_PLACEHOLDER,
-            note_text,
-        )
-        request_contents = base_prompt
-        last_error: Exception | None = None
-        last_failure_reason = "invalid_output"
-
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            attempt_started_at = time.perf_counter()
-            processing_token = _response_processing_started_at.set(None)
-            usage_token = _response_usage_metadata.set(None)
-            try:
-                async for chunk in self._stream_model(request_contents, attempt):
-                    if chunk:
-                        yield chunk
-                return
 
             except (ValidationError, ValueError) as exc:
                 last_error = exc

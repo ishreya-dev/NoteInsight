@@ -29,6 +29,7 @@ from app.services.firestore_client import (
 from app.services.gemini_client import (
     GeminiClient,
     get_gemini_client,
+    PROMPT_VERSION,
 )
 from app.services.analysis_jobs import stream_analysis_and_persist
 
@@ -432,31 +433,25 @@ async def _persist_and_finish(
     analysis: Analysis,
 ) -> None:
     condition_count = 0 if analysis.is_failed else len(analysis.conditions)
-    try:
-        await db.persist_analysis_for_note(
-            analysis,
-            condition_count=condition_count,
-        )
-    except Exception:
-        logger.exception("Failed to persist analysis for note %s", note.id)
-    try:
-        await db.finish_analysis_job(
-            job_id=job_id,
-            status=(
-                AnalysisJobStatus.FAILED.value
-                if analysis.is_failed
-                else AnalysisJobStatus.COMPLETED.value
-            ),
-            analysis_id=analysis.id,
-            error_message=(
-                "Analysis failed. Please try again."
-                if analysis.is_failed
-                else None
-            ),
-            error_reason=analysis.failure_reason if analysis.is_failed else None,
-        )
-    except Exception:
-        logger.exception("Failed to finish analysis job %s", job_id)
+    await db.persist_analysis_for_note(
+        analysis,
+        condition_count=condition_count,
+    )
+    await db.finish_analysis_job(
+        job_id=job_id,
+        status=(
+            AnalysisJobStatus.FAILED.value
+            if analysis.is_failed
+            else AnalysisJobStatus.COMPLETED.value
+        ),
+        analysis_id=analysis.id,
+        error_message=(
+            "Analysis failed. Please try again."
+            if analysis.is_failed
+            else None
+        ),
+        error_reason=analysis.failure_reason if analysis.is_failed else None,
+    )
 
 
 def _create_failed_analysis(

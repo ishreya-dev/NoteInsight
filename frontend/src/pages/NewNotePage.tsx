@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import { ApiError } from "../api/errors";
@@ -16,8 +16,6 @@ export default function NewNotePage() {
 
   const [error, setError] =
     useState<string | null>(null);
-
-  useEffect(() => () => streamAbort.current?.abort(), []);
 
   async function handleSubmit(
     payload: NoteCreatePayload,

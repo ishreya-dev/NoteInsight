@@ -61,6 +61,7 @@ export interface Note {
   visit_date: string | null;
   created_at: string;
   latest_analysis_id: string | null;
+  analysis_job_id: string | null;
   review_status: NoteReviewStatus;
   condition_count: number;
 }
