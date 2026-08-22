@@ -306,7 +306,10 @@ async def stream_analysis(
                     data_reached = False
                     summary_marker = "SUMMARY:"
                     data_marker = "DATA:"
-                    async for chunk in gemini.stream_analyze_note(note.raw_text):
+                    async for chunk in gemini.stream_analyze_note(
+                        note.raw_text,
+                        deadline_at=deadline_at,
+                    ):
                         if time.perf_counter() > deadline_at:
                             raise asyncio.TimeoutError()
                         raw_parts.append(chunk)
@@ -326,9 +329,13 @@ async def stream_analysis(
                                 emitted_len = send_upto
                             if data_idx != -1:
                                 data_reached = True
+                    if time.perf_counter() > deadline_at:
+                        raise asyncio.TimeoutError()
                     analysis = await stream_analysis_and_persist(
                         note, db, gemini, settings, raw_text="".join(raw_parts)
                     )
+                    if time.perf_counter() > deadline_at:
+                        raise asyncio.TimeoutError()
                     await _persist_and_finish(db, note, job_id, analysis)
                 except GeminiAnalysisError as exc:
                     analysis = _create_failed_analysis(

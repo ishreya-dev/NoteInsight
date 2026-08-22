@@ -201,6 +201,12 @@ def db() -> AsyncMock:
 def gemini() -> AsyncMock:
     mock = AsyncMock()
     mock.analyze_note = AsyncMock(return_value=make_analysis_result())
+
+    async def _stream_analyze_note(*args, **kwargs):
+        return
+        yield  # pragma: no cover
+
+    mock.stream_analyze_note = _stream_analyze_note
     return mock
 
 

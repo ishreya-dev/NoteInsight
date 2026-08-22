@@ -435,7 +435,9 @@ class GeminiClient:
         ) from last_error
 
     async def stream_analyze_note(
-        self, note_text: str
+        self,
+        note_text: str,
+        deadline_at: float | None = None,
     ) -> AsyncIterator[str]:
         """Yield raw text chunks from Gemini for incremental streaming.
 
@@ -475,6 +477,8 @@ class GeminiClient:
                     _safe_error_summary(exc),
                 )
                 if attempt < _MAX_ATTEMPTS:
+                    if deadline_at is not None and time.perf_counter() > deadline_at:
+                        raise asyncio.TimeoutError()
                     request_contents = build_validation_retry_prompt(
                         base_prompt,
                         exc,
@@ -506,26 +510,42 @@ class GeminiClient:
                     _status_code_from_exception(exc),
                 )
                 if attempt < _MAX_ATTEMPTS:
+                    if deadline_at is not None and time.perf_counter() > deadline_at:
+                        raise asyncio.TimeoutError()
                     request_contents = base_prompt
                     if _is_resource_exhausted(exc):
                         retry_delay, delay_source = _retry_delay_from_exception(exc)
+                        capped_delay = (
+                            min(retry_delay, deadline_at - time.perf_counter())
+                            if deadline_at is not None
+                            else retry_delay
+                        )
+                        if capped_delay <= 0:
+                            raise asyncio.TimeoutError()
                         logger.info(
                             "gemini_retry_scheduled attempt=%d error_type=429 "
                             "retry_delay_ms=%d delay_source=%s",
                             attempt,
-                            round(retry_delay * 1000),
+                            round(capped_delay * 1000),
                             delay_source,
                         )
-                        await asyncio.sleep(retry_delay)
+                        await asyncio.sleep(capped_delay)
                     else:
+                        fallback_delay = _429_FALLBACK_DELAY_SECONDS
+                        if deadline_at is not None:
+                            remaining = deadline_at - time.perf_counter()
+                            if fallback_delay > remaining:
+                                raise asyncio.TimeoutError()
                         logger.info(
                             "gemini_retry_scheduled attempt=%d error_type=%s "
                             "retry_delay_ms=%d delay_source=fallback",
                             attempt,
                             type(exc).__name__,
-                            round(_429_FALLBACK_DELAY_SECONDS * 1000),
+                            round(fallback_delay * 1000),
                         )
-                        await asyncio.sleep(_429_FALLBACK_DELAY_SECONDS)
+                        await asyncio.sleep(fallback_delay)
+                    if deadline_at is not None and time.perf_counter() > deadline_at:
+                        raise asyncio.TimeoutError()
             finally:
                 processing_started_at = _response_processing_started_at.get()
                 if processing_started_at is not None:

@@ -47,7 +47,7 @@ class FakeGemini:
         self.call_count = 0
         self.chunks_yielded = 0
 
-    def stream_analyze_note(self, note_text):
+    def stream_analyze_note(self, note_text, deadline_at=None):
         self.call_count += 1
         async def _stream():
             for chunk in CHUNKS:
@@ -153,7 +153,7 @@ class TestSingleCallStreaming:
         # Override gemini to stream incomplete output (no DATA: marker)
         bad_gemini = FakeGemini()
         bad_gemini.call_count = 0
-        async def bad_stream(note_text):
+        async def bad_stream(note_text, deadline_at=None):
             bad_gemini.call_count += 1
             yield "SUMMARY:\n"
             yield "Partial summary without JSON data"
