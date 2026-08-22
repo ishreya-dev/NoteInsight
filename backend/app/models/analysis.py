@@ -64,6 +64,12 @@ def _reject_duplicate_source_ids(source_ids: list[str]) -> None:
         raise ValueError("A source condition cannot be reviewed more than once")
 
 
+def _normalize_condition_name(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = " ".join(normalized.split())
+    return normalized
+
+
 class ConditionFromModel(BaseModel):
     """Mutable condition shape returned by the model before persistence."""
 
@@ -161,6 +167,35 @@ class GeminiRawResponse(BaseModel):
     @classmethod
     def validate_summary(cls, value: str) -> str:
         return _require_non_whitespace(value)
+
+    @model_validator(mode="after")
+    def validate_unique_condition_names(self) -> "GeminiRawResponse":
+        seen: set[str] = set()
+        for condition in self.conditions:
+            normalized = _normalize_condition_name(condition.condition_name)
+            if normalized in seen:
+                raise ValueError(
+                    f"Duplicate condition name: {condition.condition_name!r}"
+                )
+            seen.add(normalized)
+        return self
+
+    @model_validator(mode="after")
+    def validate_related_condition_references(self) -> "GeminiRawResponse":
+        if not self.gaps:
+            return self
+        condition_names = {
+            _normalize_condition_name(condition.condition_name)
+            for condition in self.conditions
+        }
+        for gap in self.gaps:
+            if gap.related_condition is not None:
+                normalized = _normalize_condition_name(gap.related_condition)
+                if normalized not in condition_names:
+                    raise ValueError(
+                        f"related_condition {gap.related_condition!r} does not match any condition name"
+                    )
+        return self
 
 
 class Analysis(BaseModel):

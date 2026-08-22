@@ -7,6 +7,8 @@ import logging
 import time
 import uuid
 
+from pydantic import ValidationError
+
 from app.config import Settings
 from app.models.analysis import Analysis, AnalysisJobStatus, Condition, DocumentationGap, GeminiRawResponse
 from app.models.note import Note
@@ -26,6 +28,7 @@ from app.services.gemini_client import (
     GeminiAnalysisError,
     GeminiClient,
     PROMPT_VERSION,
+    build_validation_retry_prompt,
     strip_markdown_fences,
     _normalize_response_payload,
     verify_evidence_quote,
@@ -33,6 +36,17 @@ from app.services.gemini_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _stream_note(
+    gemini: GeminiClient,
+    note_text: str,
+    request_contents: str | None = None,
+) -> str:
+    parts: list[str] = []
+    async for chunk in gemini.stream_analyze_note(note_text, request_contents=request_contents):
+        parts.append(chunk)
+    return "".join(parts)
 
 
 async def stream_analysis_and_persist(
@@ -52,24 +66,31 @@ async def stream_analysis_and_persist(
     result = None
     try:
         if raw_text is None:
-            result = await _get_cached_result(db, cache_key)
+            result = await _get_cached_result(db, cache_key, note.raw_text)
         if result is None:
             if raw_text is None:
-                full_text_parts: list[str] = []
-                async for chunk in gemini.stream_analyze_note(note.raw_text):
-                    full_text_parts.append(chunk)
-                raw_text = "".join(full_text_parts)
-            cleaned = extract_json_after_data(strip_markdown_fences(raw_text))
-            if not cleaned:
-                raise ValueError("Gemini returned an empty response")
+                raw_text = await _stream_note(gemini, note.raw_text)
             try:
-                parsed_obj = json.loads(cleaned)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Gemini returned malformed JSON") from exc
-            normalized = _normalize_response_payload(parsed_obj)
-            parsed = GeminiRawResponse.model_validate(normalized)
-            result = _analysis_result_from_parsed(parsed, note.raw_text, settings)
-            await _store_cached_result(db, cache_key, result, note_text=note.raw_text)
+                result = _parse_streamed_response(raw_text, note.raw_text, settings)
+                await _store_cached_result(db, cache_key, result, note_text=note.raw_text)
+            except GeminiAnalysisError as exc:
+                if exc.failure_reason == "invalid_output":
+                    try:
+                        base_prompt = gemini._prompt_template.replace(
+                            "{note_text}", note.raw_text
+                        )
+                        corrected_prompt = build_validation_retry_prompt(
+                            base_prompt, exc
+                        )
+                        raw_text = await _stream_note(
+                            gemini, note.raw_text, request_contents=corrected_prompt
+                        )
+                    except AttributeError:
+                        raw_text = await _stream_note(gemini, note.raw_text)
+                    result = _parse_streamed_response(raw_text, note.raw_text, settings)
+                    await _store_cached_result(db, cache_key, result, note_text=note.raw_text)
+                else:
+                    raise
     except GeminiAnalysisError:
         raise
     except Exception as exc:
@@ -161,12 +182,12 @@ async def _analyze_and_persist(
     )
 
     try:
-        result = await _get_cached_result(db, cache_key)
+        result = await _get_cached_result(db, cache_key, note.raw_text)
         if result is None:
             similar = await find_similar_cached_analysis(db, note.raw_text)
             if similar is not None:
                 try:
-                    result = _parse_cached_result(similar)
+                    result = _parse_cached_result(similar, note.raw_text)
                 except (KeyError, TypeError, ValueError):
                     logger.exception(
                         "Corrupt similar-cache entry for note %s; ignoring", note.id
@@ -253,14 +274,18 @@ def _create_failed_analysis(
     )
 
 
-def _parse_cached_result(cached: dict) -> AnalysisResult:
+def _parse_cached_result(cached: dict, note_text: str) -> AnalysisResult:
     """Build an ``AnalysisResult`` from a stored cache payload dict.
 
     Shared by the exact and similar cache paths; the candidate payload from a
     near-duplicate lookup has the same shape as an exact-cache entry.
     """
     conditions = [
-        Condition(id=str(uuid.uuid4()), **condition)
+        Condition(
+            id=str(uuid.uuid4()),
+            quote_verified=verify_evidence_quote(condition["evidence_quote"], note_text),
+            **{key: value for key, value in condition.items() if key != "quote_verified"},
+        )
         for condition in cached["conditions"]
     ]
     gaps = [DocumentationGap(**gap) for gap in cached["gaps"]]
@@ -276,6 +301,7 @@ def _parse_cached_result(cached: dict) -> AnalysisResult:
 async def _get_cached_result(
     db: FirestoreClient,
     cache_key: str,
+    note_text: str,
 ) -> AnalysisResult | None:
     """Return a cached Gemini result for identical note text, if any.
 
@@ -292,7 +318,7 @@ async def _get_cached_result(
         return None
 
     try:
-        return _parse_cached_result(cached)
+        return _parse_cached_result(cached, note_text)
     except (KeyError, TypeError, ValueError):
         logger.exception(
             "Corrupt analysis cache entry for key %s; ignoring", cache_key
@@ -363,6 +389,32 @@ def _analysis_result_from_parsed(
         model_version=settings.gemini_model,
         prompt_version=PROMPT_VERSION,
     )
+
+
+def _parse_streamed_response(
+    raw_text: str,
+    note_text: str,
+    settings: Settings,
+) -> AnalysisResult:
+    cleaned = extract_json_after_data(strip_markdown_fences(raw_text))
+    if not cleaned:
+        raise GeminiAnalysisError(
+            "Gemini returned an empty response", failure_reason="invalid_output"
+        )
+    try:
+        parsed_obj = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise GeminiAnalysisError(
+            "Gemini returned malformed JSON", failure_reason="invalid_output"
+        ) from exc
+    normalized = _normalize_response_payload(parsed_obj)
+    try:
+        parsed = GeminiRawResponse.model_validate(normalized)
+    except ValidationError as exc:
+        raise GeminiAnalysisError(
+            "Gemini returned invalid output", failure_reason="invalid_output"
+        ) from exc
+    return _analysis_result_from_parsed(parsed, note_text, settings)
 
 
 async def find_similar_cached_analysis(

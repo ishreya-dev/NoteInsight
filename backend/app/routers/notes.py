@@ -308,7 +308,7 @@ async def stream_analysis(
                     PROMPT_VERSION,
                     settings.gemini_model,
                 )
-                cached_result = await _get_cached_result(db, cache_key)
+                cached_result = await _get_cached_result(db, cache_key, note.raw_text)
                 if cached_result is not None:
                     analysis = Analysis(
                         id=str(uuid.uuid4()),
@@ -331,7 +331,7 @@ async def stream_analysis(
                 similar_result = await find_similar_cached_analysis(db, note.raw_text)
                 if similar_result is not None:
                     try:
-                        parsed_similar = _parse_cached_result(similar_result)
+                        parsed_similar = _parse_cached_result(similar_result, note.raw_text)
                     except (KeyError, TypeError, ValueError):
                         parsed_similar = None
                     if parsed_similar is not None:

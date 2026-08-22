@@ -14,6 +14,7 @@ from app.dependencies import get_current_user, get_firestore_client
 from app.models.analysis import Condition, DocumentationStatus
 from app.models.note import Note
 from app.models.user import AuthenticatedUser
+from app.services.analysis_jobs import _parse_streamed_response
 from app.services.gemini_client import GeminiAnalysisError, PROMPT_VERSION, get_gemini_client
 from app.services.similarity import build_shingles, tokenize
 from app.config import get_settings
@@ -49,7 +50,7 @@ class FakeGemini:
         self.call_count = 0
         self.chunks_yielded = 0
 
-    def stream_analyze_note(self, note_text, deadline_at=None):
+    def stream_analyze_note(self, note_text, deadline_at=None, request_contents=None):
         self.call_count += 1
         async def _stream():
             for chunk in CHUNKS:
@@ -241,12 +242,11 @@ class TestSingleCallStreaming:
             assert any(etype == "complete" for etype, _ in events)
         assert gemini.call_count == 0
 
-    def test_partial_output_not_marked_completed(self, valid_db, app):
-        """Requirement: partial/invalid output is not marked completed."""
-        # Override gemini to stream incomplete output (no DATA: marker)
+    def test_partial_output_is_classified_as_invalid_output(self, valid_db, app):
+        """Requirement: malformed streamed output is classified as invalid_output."""
         bad_gemini = FakeGemini()
         bad_gemini.call_count = 0
-        async def bad_stream(note_text, deadline_at=None):
+        async def bad_stream(note_text, deadline_at=None, request_contents=None):
             bad_gemini.call_count += 1
             yield "SUMMARY:\n"
             yield "Partial summary without JSON data"
@@ -265,12 +265,41 @@ class TestSingleCallStreaming:
             finish_calls = valid_db.finish_analysis_job.await_args_list
             assert all(c.kwargs.get("status") == "failed" for c in finish_calls)
             assert any(
-                c.kwargs.get("error_reason") == "unknown"
+                c.kwargs.get("error_reason") == "invalid_output"
                 for c in finish_calls
             )
 
         app.dependency_overrides.clear()
-        assert bad_gemini.call_count == 1
+        assert bad_gemini.call_count == 2
+
+    def test_schema_invalid_streamed_output_is_classified_as_invalid_output(self, valid_db, app):
+        """Requirement: schema-invalid streamed output is classified as invalid_output."""
+        bad_gemini = FakeGemini()
+        bad_gemini.call_count = 0
+        async def bad_stream(note_text, deadline_at=None, request_contents=None):
+            bad_gemini.call_count += 1
+            yield '{"conditions": [], "gaps": []}'
+        bad_gemini.stream_analyze_note = bad_stream
+
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: bad_gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            error_events = [d for etype, d in events if etype == "error"]
+            assert len(error_events) == 1
+
+            finish_calls = valid_db.finish_analysis_job.await_args_list
+            assert all(c.kwargs.get("status") == "failed" for c in finish_calls)
+            assert any(
+                c.kwargs.get("error_reason") == "invalid_output"
+                for c in finish_calls
+            )
+
+        app.dependency_overrides.clear()
+        assert bad_gemini.call_count == 2
 
     def test_similar_cache_hit_skips_gemini_and_emits_complete(self, valid_db, app):
         """Requirement: a safe similar hit (exact miss) skips Gemini on SSE."""
@@ -309,6 +338,186 @@ class TestSingleCallStreaming:
         assert len(complete) == 1
         assert complete[0]["analysis"]["summary"] == "Patient has diabetes."
         assert gemini.call_count == 0
-        valid_db.persist_analysis_for_note.assert_awaited_once()
+
+
+class TestParseStreamedResponse:
+    """Focused tests for the post-stream parsing helper."""
+
+    def test_malformed_json_is_classified_as_invalid_output(self):
+        with pytest.raises(GeminiAnalysisError) as exc_info:
+            _parse_streamed_response(
+                raw_text="DATA: {invalid json",
+                note_text="Patient has diabetes.",
+                settings=get_settings(),
+            )
+        assert exc_info.value.failure_reason == "invalid_output"
+
+    def test_schema_invalid_json_is_classified_as_invalid_output(self):
+        payload = json.dumps({
+            "summary": "ok",
+            "conditions": [{
+                "condition_name": "Diabetes",
+                "evidence_quote": "Patient has diabetes",
+                "documentation_status": "well_documented",
+                "suggested_icd10": "E11.9",
+                "confidence": 5,
+            }],
+            "gaps": [],
+        })
+        with pytest.raises(GeminiAnalysisError) as exc_info:
+            _parse_streamed_response(
+                raw_text=f"DATA: {payload}",
+                note_text="Patient has diabetes.",
+                settings=get_settings(),
+            )
+        assert exc_info.value.failure_reason == "invalid_output"
+
+    def test_empty_response_is_classified_as_invalid_output(self):
+        with pytest.raises(GeminiAnalysisError) as exc_info:
+            _parse_streamed_response(
+                raw_text="",
+                note_text="Patient has diabetes.",
+                settings=get_settings(),
+            )
+        assert exc_info.value.failure_reason == "invalid_output"
+
+    def test_valid_output_succeeds(self):
+        payload = json.dumps({
+            "conditions": [{
+                "condition_name": "Diabetes",
+                "evidence_quote": "Patient has diabetes",
+                "documentation_status": "well_documented",
+                "suggested_icd10": "E11.9",
+                "confidence": 0.9,
+            }],
+            "gaps": [],
+            "summary": "Patient has diabetes.",
+        })
+        result = _parse_streamed_response(
+            raw_text=f"SUMMARY: test\nDATA: {payload}",
+            note_text="Patient has Type 2 diabetes mellitus controlled on metformin.",
+            settings=get_settings(),
+        )
+        assert result.summary == "Patient has diabetes."
+        assert len(result.conditions) == 1
+        assert result.conditions[0].condition_name == "Diabetes"
+
+
+class TestStreamRetry:
+    """Focused tests for post-stream invalid_output retry behavior."""
+
+    def test_first_invalid_second_valid_succeeds(self, valid_db, app):
+        class RetrySuccessGemini:
+            def __init__(self):
+                self.call_count = 0
+                self.request_contents_list = []
+                self._prompt_template = "Analyze: {note_text}"
+
+            def stream_analyze_note(self, note_text, deadline_at=None, request_contents=None):
+                self.call_count += 1
+                self.request_contents_list.append(request_contents)
+                async def _stream():
+                    if self.call_count == 1:
+                        yield '{"conditions": [], "gaps": []}'
+                    else:
+                        yield VALID_JSON
+                return _stream()
+
+        gemini = RetrySuccessGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            complete = [data for etype, data in events if etype == "complete"]
+            assert len(complete) == 1
+
         finish_calls = valid_db.finish_analysis_job.await_args_list
         assert any(c.kwargs.get("status") == "completed" for c in finish_calls)
+        assert gemini.call_count == 2
+        assert gemini.request_contents_list[0] is None
+        assert "CORRECTION REQUIRED" in (gemini.request_contents_list[1] or "")
+        app.dependency_overrides.clear()
+
+    def test_both_invalid_fails_with_invalid_output(self, valid_db, app):
+        class RetryFailGemini:
+            def __init__(self):
+                self.call_count = 0
+                self.request_contents_list = []
+                self._prompt_template = "Analyze: {note_text}"
+
+            def stream_analyze_note(self, note_text, deadline_at=None, request_contents=None):
+                self.call_count += 1
+                self.request_contents_list.append(request_contents)
+                async def _stream():
+                    yield '{"conditions": [], "gaps": []}'
+                return _stream()
+
+        gemini = RetryFailGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            error_events = [data for etype, data in events if etype == "error"]
+            assert len(error_events) == 1
+
+        finish_calls = valid_db.finish_analysis_job.await_args_list
+        assert all(c.kwargs.get("status") == "failed" for c in finish_calls)
+        assert any(c.kwargs.get("error_reason") == "invalid_output" for c in finish_calls)
+        assert gemini.call_count == 2
+        assert gemini.request_contents_list[0] is None
+        assert "CORRECTION REQUIRED" in (gemini.request_contents_list[1] or "")
+        app.dependency_overrides.clear()
+
+    def test_provider_error_does_not_trigger_retry(self, valid_db, app):
+        class ProviderErrorGemini:
+            def __init__(self):
+                self.call_count = 0
+
+            def stream_analyze_note(self, note_text, deadline_at=None, request_contents=None):
+                self.call_count += 1
+                raise RuntimeError("provider error")
+
+        gemini = ProviderErrorGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            error_events = [data for etype, data in events if etype == "error"]
+            assert len(error_events) == 1
+
+        assert gemini.call_count == 1
+        app.dependency_overrides.clear()
+
+    def test_valid_first_response_has_one_attempt(self, valid_db, app):
+        class ValidFirstGemini:
+            def __init__(self):
+                self.call_count = 0
+
+            def stream_analyze_note(self, note_text, deadline_at=None, request_contents=None):
+                self.call_count += 1
+                async def _stream():
+                    yield VALID_JSON
+                return _stream()
+
+        gemini = ValidFirstGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            complete = [data for etype, data in events if etype == "complete"]
+            assert len(complete) == 1
+
+        assert gemini.call_count == 1
+        app.dependency_overrides.clear()

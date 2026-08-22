@@ -190,13 +190,14 @@ def verify_evidence_quote(evidence_quote: str, note_text: str) -> bool:
 
     Uses exact containment first, then NFC-normalized stripped containment so
     trivial whitespace/Unicode differences do not falsely mark a quote unverified.
+    Rejects quotes shorter than 3 non-whitespace characters.
     """
+    normalized_quote = unicodedata.normalize("NFC", evidence_quote.strip())
+    if len(normalized_quote) < 3:
+        return False
+
     if evidence_quote in note_text:
         return True
-
-    normalized_quote = unicodedata.normalize("NFC", evidence_quote.strip())
-    if not normalized_quote:
-        return False
 
     normalized_note = unicodedata.normalize("NFC", note_text)
     return normalized_quote in normalized_note
@@ -307,7 +308,7 @@ class GeminiClient:
     async def analyze_note(self, note_text: str) -> AnalysisResult:
         """Analyze a clinical note and return validated structured output."""
         if not note_text.strip():
-            raise GeminiAnalysisError("Clinical note text is empty")
+            raise GeminiAnalysisError("Clinical note text is empty", failure_reason="empty_note")
 
         base_prompt = self._prompt_template.replace(
             _NOTE_PLACEHOLDER,
@@ -438,6 +439,7 @@ class GeminiClient:
         self,
         note_text: str,
         deadline_at: float | None = None,
+        request_contents: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield raw text chunks from Gemini for incremental streaming.
 
@@ -445,13 +447,16 @@ class GeminiClient:
         for final validation and persistence.
         """
         if not note_text.strip():
-            raise GeminiAnalysisError("Clinical note text is empty")
+            raise GeminiAnalysisError("Clinical note text is empty", failure_reason="empty_note")
 
-        base_prompt = self._prompt_template.replace(
-            _NOTE_PLACEHOLDER,
-            note_text,
-        )
-        request_contents = base_prompt
+        if request_contents is None:
+            base_prompt = self._prompt_template.replace(
+                _NOTE_PLACEHOLDER,
+                note_text,
+            )
+            request_contents = base_prompt
+        else:
+            base_prompt = request_contents
         last_error: Exception | None = None
         last_failure_reason = "invalid_output"
 

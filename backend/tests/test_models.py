@@ -18,6 +18,7 @@ from app.models.analysis import (
     DocumentationGap,
     DocumentationGapFromModel,
     DocumentationStatus,
+    GeminiRawResponse,
     ReviewCreate,
 )
 from app.models.note import NoteCreate
@@ -238,6 +239,250 @@ def test_failed_analysis_requires_failure_reason() -> None:
             is_failed=True,
             failure_reason=None,
         )
+
+
+def test_gemini_raw_response_accepts_unique_conditions() -> None:
+    GeminiRawResponse(
+        conditions=[
+            ConditionFromModel(
+                condition_name="Type 2 diabetes mellitus",
+                evidence_quote="controlled on metformin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E11.9",
+                confidence=0.9,
+            ),
+            ConditionFromModel(
+                condition_name="Hypertension",
+                evidence_quote="blood pressure controlled",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="I10",
+                confidence=0.8,
+            ),
+        ],
+        gaps=[],
+        summary="Follow-up visit.",
+    )
+
+
+def test_gemini_raw_response_rejects_exact_duplicate_conditions() -> None:
+    with pytest.raises(ValidationError):
+        GeminiRawResponse(
+            conditions=[
+                ConditionFromModel(
+                    condition_name="Type 2 diabetes mellitus",
+                    evidence_quote="controlled on metformin",
+                    documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                    suggested_icd10="E11.9",
+                    confidence=0.9,
+                ),
+                ConditionFromModel(
+                    condition_name="Type 2 diabetes mellitus",
+                    evidence_quote="different quote",
+                    documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                    suggested_icd10="E11.9",
+                    confidence=0.9,
+                ),
+            ],
+            gaps=[],
+            summary="Follow-up visit.",
+        )
+
+
+def test_gemini_raw_response_rejects_case_only_duplicate_conditions() -> None:
+    with pytest.raises(ValidationError):
+        GeminiRawResponse(
+            conditions=[
+                ConditionFromModel(
+                    condition_name="Type 2 diabetes mellitus",
+                    evidence_quote="controlled on metformin",
+                    documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                    suggested_icd10="E11.9",
+                    confidence=0.9,
+                ),
+                ConditionFromModel(
+                    condition_name="type 2 diabetes mellitus",
+                    evidence_quote="different quote",
+                    documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                    suggested_icd10="E11.9",
+                    confidence=0.9,
+                ),
+            ],
+            gaps=[],
+            summary="Follow-up visit.",
+        )
+
+
+def test_gemini_raw_response_rejects_whitespace_only_duplicate_conditions() -> None:
+    with pytest.raises(ValidationError):
+        GeminiRawResponse(
+            conditions=[
+                ConditionFromModel(
+                    condition_name="Type 2 diabetes mellitus",
+                    evidence_quote="controlled on metformin",
+                    documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                    suggested_icd10="E11.9",
+                    confidence=0.9,
+                ),
+                ConditionFromModel(
+                    condition_name="  type 2  diabetes  mellitus  ",
+                    evidence_quote="different quote",
+                    documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                    suggested_icd10="E11.9",
+                    confidence=0.9,
+                ),
+            ],
+            gaps=[],
+            summary="Follow-up visit.",
+        )
+
+
+def test_gemini_raw_response_accepts_different_condition_names() -> None:
+    GeminiRawResponse(
+        conditions=[
+            ConditionFromModel(
+                condition_name="Type 2 diabetes mellitus",
+                evidence_quote="controlled on metformin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E11.9",
+                confidence=0.9,
+            ),
+            ConditionFromModel(
+                condition_name="Type 1 diabetes mellitus",
+                evidence_quote="on insulin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E10.9",
+                confidence=0.9,
+            ),
+        ],
+        gaps=[],
+        summary="Follow-up visit.",
+    )
+
+
+def test_gemini_raw_response_accepts_matching_related_condition() -> None:
+    GeminiRawResponse(
+        conditions=[
+            ConditionFromModel(
+                condition_name="Type 2 diabetes mellitus",
+                evidence_quote="controlled on metformin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E11.9",
+                confidence=0.9,
+            ),
+        ],
+        gaps=[
+            DocumentationGapFromModel(
+                description="A1C value not documented",
+                related_condition="Type 2 diabetes mellitus",
+            ),
+        ],
+        summary="Follow-up visit.",
+    )
+
+
+def test_gemini_raw_response_accepts_case_only_difference_related_condition() -> None:
+    GeminiRawResponse(
+        conditions=[
+            ConditionFromModel(
+                condition_name="Type 2 diabetes mellitus",
+                evidence_quote="controlled on metformin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E11.9",
+                confidence=0.9,
+            ),
+        ],
+        gaps=[
+            DocumentationGapFromModel(
+                description="A1C value not documented",
+                related_condition="type 2 diabetes mellitus",
+            ),
+        ],
+        summary="Follow-up visit.",
+    )
+
+
+def test_gemini_raw_response_accepts_whitespace_only_difference_related_condition() -> None:
+    GeminiRawResponse(
+        conditions=[
+            ConditionFromModel(
+                condition_name="Type 2 diabetes mellitus",
+                evidence_quote="controlled on metformin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E11.9",
+                confidence=0.9,
+            ),
+        ],
+        gaps=[
+            DocumentationGapFromModel(
+                description="A1C value not documented",
+                related_condition="  type 2  diabetes  mellitus  ",
+            ),
+        ],
+        summary="Follow-up visit.",
+    )
+
+
+def test_gemini_raw_response_rejects_non_existent_related_condition() -> None:
+    with pytest.raises(ValidationError):
+        GeminiRawResponse(
+            conditions=[
+                ConditionFromModel(
+                    condition_name="Type 2 diabetes mellitus",
+                    evidence_quote="controlled on metformin",
+                    documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                    suggested_icd10="E11.9",
+                    confidence=0.9,
+                ),
+            ],
+            gaps=[
+                DocumentationGapFromModel(
+                    description="A1C value not documented",
+                    related_condition="Hypertension",
+                ),
+            ],
+            summary="Follow-up visit.",
+        )
+
+
+def test_gemini_raw_response_accepts_none_related_condition() -> None:
+    GeminiRawResponse(
+        conditions=[
+            ConditionFromModel(
+                condition_name="Type 2 diabetes mellitus",
+                evidence_quote="controlled on metformin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E11.9",
+                confidence=0.9,
+            ),
+        ],
+        gaps=[
+            DocumentationGapFromModel(
+                description="A1C value not documented",
+                related_condition=None,
+            ),
+        ],
+        summary="Follow-up visit.",
+    )
+
+
+def test_gemini_raw_response_accepts_missing_related_condition() -> None:
+    GeminiRawResponse(
+        conditions=[
+            ConditionFromModel(
+                condition_name="Type 2 diabetes mellitus",
+                evidence_quote="controlled on metformin",
+                documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+                suggested_icd10="E11.9",
+                confidence=0.9,
+            ),
+        ],
+        gaps=[
+            DocumentationGapFromModel(
+                description="A1C value not documented",
+            ),
+        ],
+        summary="Follow-up visit.",
+    )
 
 
 # ---- Notes ----

@@ -74,10 +74,43 @@ async def test_empty_note_does_not_call_gemini(
     client = _make_client(monkeypatch)
     client._call_model = AsyncMock()
 
-    with pytest.raises(GeminiAnalysisError, match="empty"):
+    with pytest.raises(GeminiAnalysisError, match="empty") as exc_info:
         await client.analyze_note("   ")
 
+    assert exc_info.value.failure_reason == "empty_note"
     client._call_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_string_note_is_classified_as_empty_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    client._call_model = AsyncMock()
+
+    with pytest.raises(GeminiAnalysisError, match="empty") as exc_info:
+        await client.analyze_note("")
+
+    assert exc_info.value.failure_reason == "empty_note"
+    client._call_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stream_empty_note_does_not_call_gemini(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+
+    async def _stream(prompt: str, attempt: int):
+        yield ""
+
+    client._stream_model = _stream
+
+    with pytest.raises(GeminiAnalysisError, match="empty") as exc_info:
+        async for _ in client.stream_analyze_note("   "):
+            pass
+
+    assert exc_info.value.failure_reason == "empty_note"
 
 
 @pytest.mark.asyncio
@@ -291,7 +324,13 @@ async def test_condition_ids_are_unique(monkeypatch: pytest.MonkeyPatch) -> None
                 "suggested_icd10": "I10",
                 "confidence": 0.8,
             },
-        ]
+        ],
+        gaps=[
+            {
+                "description": "A1C value not documented",
+                "related_condition": "Asthma",
+            }
+        ],
     )
     client._call_model = AsyncMock(
         return_value=json.dumps(payload)
@@ -377,7 +416,7 @@ async def test_provider_errors_retry_then_fail(
         await client.analyze_note("Patient presents with cough.")
 
     assert client._call_model.await_count == 2
-    sleep.assert_not_awaited()
+    sleep.assert_awaited_once_with(gemini_module._429_FALLBACK_DELAY_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -593,6 +632,33 @@ def test_verify_evidence_quote_exact_and_whitespace_tolerant() -> None:
     assert verify_evidence_quote("Type 2 diabetes", note) is True
     assert verify_evidence_quote("  Type 2 diabetes  ", note) is True
     assert verify_evidence_quote("invented", note) is False
+
+
+def test_verify_evidence_quote_rejects_whitespace_only_quote() -> None:
+    note = "Patient has Type 2 diabetes."
+    assert verify_evidence_quote("   ", note) is False
+
+
+def test_verify_evidence_quote_rejects_single_character_quote() -> None:
+    note = "Patient has Type 2 diabetes."
+    assert verify_evidence_quote("a", note) is False
+    assert verify_evidence_quote("B", note) is False
+
+
+def test_verify_evidence_quote_rejects_trivial_short_quote() -> None:
+    note = "Patient has Type 2 diabetes."
+    assert verify_evidence_quote("ab", note) is False
+    assert verify_evidence_quote("xy", note) is False
+
+
+def test_verify_evidence_quote_accepts_short_clinically_meaningful_quote() -> None:
+    note = "A1C was 7.0%."
+    assert verify_evidence_quote("A1C", note) is True
+
+
+def test_verify_evidence_quote_nfc_normalized_matching_still_works() -> None:
+    note = "Patient has café."
+    assert verify_evidence_quote("cafe\u0301", note) is True
 
 
 def test_retry_prompt_includes_safe_error_summary() -> None:

@@ -152,3 +152,43 @@ async def test_full_cache_miss_keeps_existing_gemini_behavior():
     db.persist_analysis_for_note.assert_awaited_once()
     assert analysis.summary == "gemini summary"
     assert not analysis.is_failed
+
+
+@pytest.mark.asyncio
+async def test_cached_valid_quote_is_reverified_as_true():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    db = _db(get_cached=_cached_payload())
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    assert analysis.conditions[0].quote_verified is True
+
+
+@pytest.mark.asyncio
+async def test_cached_invalid_quote_is_reverified_as_false():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    cached = _cached_payload()
+    cached["conditions"][0]["evidence_quote"] = "not in note"
+    db = _db(get_cached=cached)
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    assert analysis.conditions[0].quote_verified is False
+
+
+@pytest.mark.asyncio
+async def test_cached_stored_false_but_valid_quote_is_freshly_verified():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    cached = _cached_payload()
+    cached["conditions"][0]["quote_verified"] = False
+    db = _db(get_cached=cached)
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    assert analysis.conditions[0].quote_verified is True

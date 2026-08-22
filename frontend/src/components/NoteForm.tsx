@@ -6,6 +6,8 @@ interface NoteFormProps {
   submitting: boolean;
 }
 
+const MAX_RAW_TEXT_WORDS = 6_000;
+
 export default function NoteForm({
   onSubmit,
   submitting,
@@ -33,6 +35,13 @@ export default function NoteForm({
     if (trimmedText.length > 20_000) {
       setValidationError(
         `Note is too long (${trimmedText.length} characters, max 20,000).`,
+      );
+      return;
+    }
+
+    if (wordCount > MAX_RAW_TEXT_WORDS) {
+      setValidationError(
+        `Note is too long (${wordCount} words, max ${MAX_RAW_TEXT_WORDS}).`,
       );
       return;
     }
