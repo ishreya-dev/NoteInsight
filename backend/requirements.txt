@@ -13,3 +13,4 @@ pytest-asyncio
 httpx
 mypy==2.2.0
 ruff==0.15.20
+email-validator
