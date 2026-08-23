@@ -1,1022 +1,515 @@
 # Note Insight
 
-> **Branch note:** This README documents a separate feature branch of the project — not the `main` branch. This branch focuses specifically on observability, reliability, and latency improvements to the Gemini analysis pipeline, described in detail below.
+## Overview
 
-An AI-powered clinical note analysis application that extracts potential conditions, supporting evidence, documentation gaps, and a concise clinical summary from free-text notes.
+Note Insight is an AI-powered clinical note analysis application. A clinician pastes free-text clinical notes into the interface, and the application uses Google Gemini to extract structured information: potential conditions, verbatim evidence quotes, documentation status, suggested ICD-10 codes, confidence scores, and actionable documentation gaps, plus a concise clinical summary.
 
-This branch focuses on improving **observability, reliability, retry behavior, error handling, and understanding of latency bottlenecks** in the Gemini analysis pipeline.
+The application is built as a full-stack demo with a React frontend, FastAPI backend, Firestore database, and Gemini structured output. Every AI-generated item is presented for clinician review and correction.
 
-> ⚠️ This application is designed as an analysis and documentation-support tool. It does not replace professional clinical judgment.
+## User Journey
 
----
+1. **Login** — Authenticate with Firebase Auth.
+2. **Submit note** — Paste raw clinical text, optionally add a pseudonym and visit date.
+3. **Streaming analysis** — Open an SSE connection to receive a progressive summary and final structured analysis (conditions, evidence, gaps, ICD-10, confidence).
+4. **Human review** — Accept, edit, reject, or add conditions; review documentation gaps; add reviewer notes.
+5. **History** — Browse past notes and their analysis/review status.
 
-## What Makes This Branch Different?
+## Features
 
-The main goal of this branch was not to add more features.
-
-Instead, the focus was on understanding:
-
-- Where analysis latency actually comes from
-- How large Gemini responses typically are
-- How many conditions and documentation gaps are returned
-- How token usage behaves
-- Why some requests fail
-- How Gemini rate limits affect the user experience
-- How retries should behave when the provider explicitly tells us when to retry
-- How to show meaningful errors instead of generic failure messages
-
-The result is a more observable and resilient AI pipeline.
-
----
+- **Firebase Authentication** — Email/password Firebase Auth providers.
+- **Note submission** — Validated input (≤20,000 characters, ≤6,000 words, pseudonym PHI guards).
+- **Structured Gemini analysis** — Conditions, evidence quotes, documentation status, suggested ICD-10, confidence, documentation gaps, and clinical summary.
+- **Evidence verification** — Every evidence quote is checked against the source note; hallucinated quotes are flagged `quote_verified=False` but preserved for clinician awareness.
+- **Streaming SSE** — Progressive summary delivery via Server-Sent Events with polling fallback for late-connecting clients.
+- **Retry and failure handling** — Provider-aware 429 retry with parsed delay (capped at 30s), validation retry with `CORRECTION REQUIRED` prompt, and categorized failure reasons (`rate_limited`, `invalid_output`, `timeout`, `provider_error`, `unknown`).
+- **Human review** — Accept, edit, reject, or add conditions; edit gaps; add reviewer notes.
+- **History and reanalysis** — List past notes, view details, and re-run analysis on demand.
+- **Exact and similar caching** — SHA-256 exact-match cache and LSH/MinHash near-duplicate cache with conservative safety checks to reduce redundant Gemini calls.
+- **Correction metrics** — Per-user aggregation of accepted, edited, rejected, and added conditions.
+- **Per-user data isolation** — Every Firestore read is scoped to the authenticated user with ownership checks.
+- **Rate limiting** — Configurable per-user analysis request limits enforced via Firestore transactions.
 
 ## Architecture
 
-```text
-                    ┌─────────────────┐
-                    │   React Client  │
-                    └────────┬────────┘
-                             │
-                             │ Create Note
-                             ▼
-                    ┌─────────────────┐
-                    │     FastAPI     │
-                    └────────┬────────┘
-                             │
-                             │ Background Analysis Job
-                             ▼
-              ┌──────────────────────────┐
-              │    Analysis Job Service  │
-              └────────────┬─────────────┘
-                           │
-                           ▼
-              ┌──────────────────────────┐
-              │      Gemini Client       │
-              │                          │
-              │  • Prompt construction   │
-              │  • API timing            │
-              │  • Retry handling        │
-              │  • Schema validation     │
-              │  • Response metrics      │
-              └────────────┬─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │   Gemini    │
-                    │     API     │
-                    └─────────────┘
-                           │
-                           ▼
-              ┌──────────────────────────┐
-              │ Structured JSON Response │
-              └────────────┬─────────────┘
-                           │
-                           ▼
-              ┌──────────────────────────┐
-              │ AnalysisResult Validation│
-              └────────────┬─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │  Firestore  │
-                    └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │ SSE / Poll  │
-                    └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │     UI      │
-                    └─────────────┘
-```
-
----
-
-## Core Features
-
-- AI-powered clinical note analysis
-- Structured JSON output
-- Condition extraction
-- Evidence quote extraction
-- Documentation gap detection
-- Clinical summary generation
-- Evidence validation
-- Retry handling
-- Gemini API latency measurement
-- Response-size metrics
-- Token usage metrics
-- Provider-aware rate-limit retry handling
-- Background analysis jobs
-- SSE-based analysis status updates
-- Firestore persistence
-- Meaningful UI error messages
-- Automated tests
-
----
-
-## The Main Bottleneck Investigation
-
-Initially, the analysis sometimes took around:
-
-```text
-11 seconds
-13 seconds
-22 seconds
-```
-
-The first question was:
-
-> Is the application slow, or is the Gemini API responsible for most of the latency?
-
-To answer that, separate timing was added around the actual Gemini API request.
-
-```text
-gemini_api_completed
-```
-
-Example:
-
-```text
-gemini_api_completed attempt=1 duration_ms=13288
-```
-
-Response processing was also measured separately:
-
-```text
-gemini_response_processing_completed attempt=1 duration_ms=1
-```
-
-The complete attempt was measured as:
-
-```text
-gemini_attempt_completed attempt=1 duration_ms=13290
-```
-
-This makes the bottleneck visible.
-
-Example interpretation:
-
-```text
-Gemini API call:        13,288 ms
-Response processing:         1 ms
-Total attempt:          13,290 ms
-```
-
-### Conclusion
-
-The application-side response processing was negligible.
-
-The majority of successful request latency was coming from the external Gemini API call.
-
----
-
-## Response Metrics
-
-Before changing prompt size, schema limits, or output-token limits, measurements were added.
-
-The application now logs:
-
-```text
-gemini_response_metrics
-```
-
-Example:
-
-```text
-gemini_response_metrics
-attempt=1
-condition_count=5
-gap_count=3
-summary_char_count=287
-max_evidence_quote_char_count=29
-total_response_char_count=1703
-input_tokens=1087
-output_tokens=396
-total_tokens=3567
-```
-
-These metrics help answer questions such as:
-
-- Are responses actually large?
-- Are we extracting too many conditions?
-- Are documentation gaps excessive?
-- Are evidence quotes too long?
-- Is output size contributing to latency?
-- What is the approximate token usage?
-
----
-
-## Why These Metrics Were Added
-
-The schema allows relatively large maximum values.
-
-For example:
-
-```text
-Maximum conditions: 50
-Maximum documentation gaps: 50
-Maximum evidence quote length: 1000 characters
-Maximum summary length: 2000 characters
-```
-
-However, the allowed maximum is not the same as the typical response.
-
-Changing these limits without data could cause:
-
-```text
-Smaller limit
-      ↓
-Legitimate response rejected
-      ↓
-Validation failure
-      ↓
-Retry
-      ↓
-More latency
-      ↓
-Possible analysis failure
-```
-
-So instead of guessing, the application first collects measurements.
-
----
-
-## Safe Logging
-
-The metrics intentionally avoid logging clinical content.
-
-The application does **NOT** log:
-
-```text
-❌ Clinical note text
-❌ Prompt contents
-❌ Patient information
-❌ Evidence quotes
-❌ Generated summary
-❌ Full Gemini response
-❌ API secrets
-```
-
-Only structural information is logged.
-
-Example:
-
-```text
-condition_count=5
-gap_count=3
-summary_char_count=287
-total_response_char_count=1703
-```
-
-This provides useful observability without exposing the actual clinical content.
-
----
-
-## Gemini Rate Limit Problem
-
-During testing, the Gemini API returned errors such as:
-
-```text
-429 RESOURCE_EXHAUSTED
-```
-
-Example provider response:
-
-```text
-Please retry in 15.44s
-```
-
-The original retry behavior could immediately retry after receiving this error.
-
-That creates a problem:
-
-```text
-Request
-   ↓
-429 Rate Limit
-   ↓
-Immediate Retry
-   ↓
-Still Rate Limited
-   ↓
-Failure
-```
-
-The provider already tells us how long to wait. Ignoring that information makes the retry less useful.
-
----
-
-## Provider-Aware Retry
-
-The retry logic now detects:
-
-```text
-429
-RESOURCE_EXHAUSTED
-```
-
-If Gemini provides:
-
-```text
-Please retry in 15.44s
-```
-
-The application schedules the retry using that delay.
-
-Example:
-
-```text
-gemini_retry_scheduled
-attempt=1
-error_type=429
-retry_delay_ms=15440
-delay_source=provider
-```
-
----
-
-## Retry Delay Cap
-
-Provider delays can sometimes be large.
-
-For example:
-
-```text
-Please retry in 50.43s
-```
-
-Waiting indefinitely would create a poor user experience. Therefore, the retry delay is capped at:
-
-```text
-30 seconds
-```
-
-Example:
-
-```text
-Provider requested: 50.43 seconds
-Actual retry delay:  30 seconds
-```
-
-Log:
-
-```text
-gemini_retry_scheduled
-attempt=1
-error_type=429
-retry_delay_ms=30000
-delay_source=provider
-```
-
----
-
-## Retry Flow
-
-```text
-                Gemini Request
-                       │
-                       ▼
-                 ┌───────────┐
-                 │ Success?  │
-                 └─────┬─────┘
-                       │
-              ┌────────┴────────┐
-              │                 │
-             Yes               No
-              │                 │
-              ▼                 ▼
-        Validate Result      Check Error
-              │                 │
-              ▼                 ▼
-         Return Result       429 / RESOURCE?
-                                  │
-                         ┌────────┴────────┐
-                         │                 │
-                        Yes               No
-                         │                 │
-                         ▼                 ▼
-                 Parse Retry Delay    Existing Retry
-                         │
-                         ▼
-                   Apply 30s Cap
-                         │
-                         ▼
-                  Async Wait
-                         │
-                         ▼
-                      Retry
-```
-
----
-
-## Important Retry Rules
-
-The implementation follows these rules:
-
-```text
-Maximum attempts: 2
-```
-
-For rate-limit errors:
-
-```text
-Provider delay available
-        ↓
-Use provider delay
-        ↓
-Cap at 30 seconds
-```
-
-If the delay cannot be parsed:
-
-```text
-Use 1 second fallback
-```
-
-On the final attempt:
-
-```text
-No unnecessary sleep
-```
-
-Non-429 errors:
-
-```text
-Existing retry behavior remains unchanged
-```
-
----
-
-## Why `asyncio.sleep()` Is Used
-
-The backend is asynchronous.
-
-Using:
-
-```python
-await asyncio.sleep(delay)
-```
-
-allows the application to wait without blocking the event loop.
-
-This is better than:
-
-```python
-time.sleep(delay)
-```
-
-because `time.sleep()` blocks the current execution thread.
-
----
-
-## Timing Boundaries
-
-The implementation separates API time from retry waiting time.
-
-For example:
-
-```text
-gemini_api_completed attempt=1 duration_ms=235
-```
-
-The provider-aware wait happens after the API request. Then:
-
-```text
-gemini_attempt_completed attempt=1 duration_ms=2135
-```
-
-This means:
-
-```text
-API call:       235 ms
-Retry delay:   1893 ms
-Total:         2135 ms
-```
-
-This distinction is important. Otherwise, a retry delay could incorrectly appear as Gemini API latency.
-
----
-
-## Example Successful Analysis
-
-```text
-analysis_job_started
-
-gemini_api_completed
-duration_ms=13288
-
-gemini_response_metrics
-condition_count=5
-gap_count=3
-summary_char_count=287
-total_response_char_count=1703
-
-gemini_response_processing_completed
-duration_ms=1
-
-gemini_attempt_completed
-duration_ms=13290
-
-persist_analysis_for_note
-duration_ms=312
-
-analysis_job_completed
-total_duration_ms=13681
-```
-
-This shows the complete breakdown.
-
----
-
-## Example Rate-Limited Analysis
-
-```text
-gemini_api_completed
-duration_ms=723
-
-429 RESOURCE_EXHAUSTED
-
-gemini_retry_scheduled
-attempt=1
-retry_delay_ms=30000
-delay_source=provider
-
-gemini_attempt_completed
-duration_ms=30702
-```
-
-The first API request itself was fast. The long attempt duration came from the intentional provider-aware retry delay.
-
----
-
-## User-Facing Error Handling
-
-Previously, a rate-limit failure could appear as a generic error such as:
-
-```text
-Gemini did not return valid output after 2 attempts
-```
-
-This is misleading when the actual problem is:
-
-```text
-429 RESOURCE_EXHAUSTED
-```
-
-The UI now distinguishes the failure type.
-
-For rate-limit failures:
-
-```text
-Analysis temporarily unavailable
-
-The AI service is currently receiving too many requests.
-Please wait a moment and try again.
-```
-
-The user can then:
-
-```text
-Retry analysis
-```
-
-or:
-
-```text
-Start a different note
-```
-
----
-
-## Why This Matters
-
-These failures are different:
-
-```text
-Invalid model response
-```
-
-and:
-
-```text
-Provider rate limit
-```
-
-They should not produce the same user-facing message.
-
-Better error classification improves:
-
-- User experience
-- Debugging
-- Observability
-- Supportability
-
----
-
-## Prompt and Output Investigation
-
-The current analysis prompt contains:
-
-```text
-Fixed prompt instructions
-        +
-Clinical note text
-```
-
-The note can be up to:
-
-```text
-20,000 characters
-```
-
-The prompt uses:
-
-```text
-temperature=0.2
-response_mime_type="application/json"
-structured response schema
-```
-
-There is currently no explicit `max_output_tokens` limit. This was intentionally not changed without production measurements.
-
----
-
-## Why `max_output_tokens` Was Not Added Yet
-
-A low output limit could cause:
-
-```text
-Response generation
-        ↓
-Output truncated
-        ↓
-Invalid JSON
-        ↓
-Schema validation failure
-        ↓
-Retry
-        ↓
-Higher latency
-```
-
-The correct approach is:
-
-```text
-Measure actual output
-        ↓
-Collect token usage
-        ↓
-Analyze response distribution
-        ↓
-Choose a safe limit
-        ↓
-Test
-```
-
-The newly added response metrics support this process.
-
----
-
-## Example Test Notes
-
-The following types of notes were used to test different output sizes and behaviors.
-
-### 1. Short Note
-
-```text
-Patient reports a mild sore throat for two days. No fever or shortness of breath. Advised hydration and rest.
-```
-
-Useful for testing:
-
-- Small input
-- Small output
-- Basic condition extraction
-
-### 2. Medium Note
-
-```text
-Patient presents with cough, nasal congestion, fatigue, and intermittent fever for five days. The patient reports reduced appetite but is able to tolerate fluids. No chest pain or shortness of breath. Physical examination notes mild throat redness. Supportive care was recommended, and the patient was advised to return if symptoms worsen.
-```
-
-Useful for testing:
-
-- Moderate input size
-- Multiple symptoms
-- Evidence extraction
-- Documentation analysis
-
-### 3. Longer Note
-
-```text
-Patient reports progressive fatigue over the last three weeks along with intermittent headaches and difficulty concentrating. Sleep has been irregular because of increased work-related stress. The patient also reports occasional dizziness when standing quickly but denies loss of consciousness. Appetite has decreased slightly, although fluid intake remains normal.
-
-Past medical history includes no known chronic illnesses. The patient is not currently taking regular medication. No recent travel was reported. The patient denies chest pain, shortness of breath, persistent vomiting, or neurological weakness.
-
-On examination, the patient was alert and oriented. Blood pressure was documented as mildly elevated during the visit. Heart rate and oxygen saturation were within normal limits. No acute distress was observed.
-
-The plan includes monitoring symptoms, improving sleep habits, maintaining hydration, and arranging follow-up if dizziness, headaches, or fatigue continue or worsen.
-```
-
-Useful for testing:
-
-- Larger prompt
-- Multiple clinical signals
-- Longer summary
-- Multiple evidence quotes
-- Documentation gaps
-
-### 4. Multiple Conditions and Documentation Gaps
-
-```text
-Patient reports persistent cough for approximately three weeks with intermittent wheezing and fatigue. The patient also reports episodes of heartburn after meals and difficulty sleeping because of coughing at night.
-
-The patient has a history of seasonal allergies but no other medical history is documented. Current medication information is not available. Smoking history is not documented.
-
-During the visit, the patient denied chest pain. Oxygen saturation was recorded as normal. No temperature was documented. Lung examination findings were not included.
-
-The patient was advised to increase fluid intake and follow up if symptoms worsen. No clear follow-up timeframe was documented.
-```
-
-Useful for testing:
-
-- Multiple possible conditions
-- Multiple evidence quotes
-- Multiple documentation gaps
-
-Potential missing information includes:
-
-```text
-Smoking history
-Current medications
-Temperature
-Lung examination findings
-Follow-up timeframe
-```
-
----
-
-## Testing Strategy
-
-The Gemini client tests cover:
-
-```text
-✓ Successful response metrics
-✓ Optional token metadata
-✓ Missing token metadata
-✓ No metrics for failed attempts
-✓ Metrics only for successful retry attempts
-✓ Provider retry delay parsing
-✓ Retry delay cap
-✓ Fallback delay
-✓ No sleep after final attempt
-✓ Non-429 behavior unchanged
-✓ Structured retry logging
-```
-
-Current test status:
-
-```text
-Focused Gemini tests: 23 passed
-Related Gemini + SSE tests: 36 passed
-Full backend suite: 115 passed
-```
-
----
-
-## Bottlenecks Identified
-
-### 1. External Model Latency
-
-Successful analysis latency is primarily dominated by:
-
-```text
-Gemini API request time
-```
-
-rather than:
-
-```text
-JSON processing
-Schema validation
-Evidence processing
-```
-
-### 2. Provider Rate Limits
-
-The free-tier request quota can produce:
-
-```text
-429 RESOURCE_EXHAUSTED
-```
-
-This is an external provider constraint. The application can handle the response intelligently, but it cannot remove the provider quota.
-
-### 3. Retry Waiting Time
-
-A provider-aware retry may increase the duration of a single analysis attempt.
-
-Example:
-
-```text
-API request: 700 ms
-Provider retry wait: 30,000 ms
-Second request: 600 ms
-
-Total: ~31 seconds
-```
-
-This is intentional. The delay avoids immediately sending another request that is likely to fail.
-
----
-
-## Troubleshooting
-
-### Analysis Takes 10–20 Seconds
-
-Check:
-
-```text
-gemini_api_completed
-```
-
-If this duration is large while `gemini_response_processing_completed` remains close to 1–5 ms, then the external model call is the primary bottleneck.
-
-### Analysis Takes Around 30 Seconds
-
-Check for:
-
-```text
-gemini_retry_scheduled
-```
-
-Example:
-
-```text
-retry_delay_ms=30000
-```
-
-This means the provider returned a rate-limit response and the retry delay was capped at 30 seconds.
-
-### Analysis Fails Immediately
-
-Check for:
-
-```text
-429 RESOURCE_EXHAUSTED
-```
-
-If both attempts fail, the provider quota is still exhausted. The application should show:
-
-```text
-Analysis temporarily unavailable
-```
-
-rather than incorrectly reporting an invalid model response.
-
-### Token Metrics Look Unexpected
-
-Check:
-
-```text
-input_tokens
-output_tokens
-total_tokens
-```
-
-These fields are provider metadata and may not always follow a simple `input_tokens + output_tokens = total_tokens` relationship, because providers may account for additional internal token categories. The application records the values reported by the SDK rather than estimating them.
-
----
-
-## Bonus Features
-
-The project can be extended with:
-
-- Streaming analysis into the UI
-- Caching identical notes
-- Inline evidence highlighting
-- Expanded failure-path tests
-- Human correction metrics
-- PDF note upload
-- Image note upload
-- Per-user rate limiting
-
-For the current branch, the priority remains:
-
-```text
-Core requirements
-        +
-Reliable analysis
-        +
-Meaningful error handling
-        +
-Good observability
-```
-
-PDF and image upload support is intentionally not part of this implementation.
-
----
-
-## Tech Stack
-
-**Frontend**
-```text
-React
-TypeScript
-Vite
-```
-
-**Backend**
-```text
-Python
-FastAPI
-Uvicorn
-Pydantic
-```
-
-**AI**
-```text
-Google Gemini API
-Structured JSON Output
-```
-
-**Data**
-```text
-Firestore
-```
-
-**Testing**
-```text
-Pytest
-```
-
----
-
-## Key Design Principle
-
-This branch follows a measurement-first approach.
-
-Instead of immediately changing:
-
-```text
-Prompt size
-Schema limits
-Output token limits
-Retry strategy
-```
-
-the application first collects enough information to understand the real behavior.
-
-```text
-Measure
-   ↓
-Identify bottleneck
-   ↓
-Make targeted change
-   ↓
-Test
-   ↓
-Measure again
-```
-
-This reduces the risk of making an optimization that improves one metric while breaking reliability somewhere else.
-
----
-
-## Summary
-
-The important improvement in this branch is not simply faster AI analysis. It is the ability to understand what is happening.
-
-The application can now distinguish between:
-
-```text
-Slow provider response
-Fast provider response + application processing
-Large response
-Rate-limited request
-Retry waiting time
-Invalid model output
-```
-
-This makes future optimization based on real measurements instead of assumptions.
-
----
-
-## Current Focus
-
-```text
-Reliable core functionality
-        +
-Clear failure handling
-        +
-Latency visibility
-        +
-Response metrics
-        +
-Provider-aware retries
-        +
-Strong automated tests
-```
-
-> A complete and reliable implementation is more valuable than adding optional features that make the system harder to maintain.
+### HLD — System Architecture
+
+```mermaid
+flowchart LR
+    classDef frontend fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef backend fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef ai fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,color:#4a148c
+    classDef security fill:#ffebee,stroke:#c62828,color:#b71c1c
+
+    user[Clinician]:::frontend
+
+    subgraph Frontend [React + Vite Frontend]
+        login[LoginPage]:::frontend
+        newnote[NewNotePage]:::frontend
+        detail[NoteDetailPage<br/>SSE + Review UI]:::frontend
+        history[HistoryPage]:::frontend
+    end
+
+    subgraph Backend [FastAPI Backend]
+        api[REST API<br/>/auth /notes /analyses /metrics]:::backend
+        sse[/notes/{id}/analysis/stream<br/>SSE Endpoint/]:::backend
+        authdep[Firebase Auth<br/>Dependency]:::security
+    end
+
+    subgraph Data [Firestore]
+        firestore[(notes / analyses<br/>reviews / jobs<br/>cache / rate_limits)]:::db
+    end
+
+    subgraph AI [Gemini]
+        gemini[generate_content<br/>generate_content_stream]:::ai
+    end
+
+    user --> login
+    login --> newnote
+    newnote --> detail
+    detail --> history
+
+    user -- Bearer token --> authdep
+    authdep --> api
+
+    api --> firestore
+    sse --> firestore
+
+    api -- REST / SSE --> user
+
+    sse -- stream call --> gemini
+    gemini -- tokens / JSON --> sse
+```
+
+### LLD — AI Analysis Pipeline
+
+```mermaid
+flowchart LR
+    classDef frontend fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef backend fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef ai fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,color:#4a148c
+    classDef security fill:#ffebee,stroke:#c62828,color:#b71c1c
+
+    note[Note raw_text]:::db
+    job[AnalysisJob<br/>pending → processing]:::db
+    exact[Exact Cache Lookup<br/>SHA-256 hash]:::db
+    similar[Similarity Cache<br/>LSH / MinHash]:::db
+    gemini[Gemini Stream<br/>SUMMARY + DATA JSON]:::ai
+    parse[Parse & Strip<br/>Markdown / DATA:]:::backend
+    schema[Schema Validation<br/>GeminiRawResponse]:::backend
+    evidence[Evidence Verification<br/>quote_verified]:::backend
+    retry[Retry / Failure<br/>CORRECTION REQUIRED<br/>or invalid_output]:::backend
+    persist[Persist Analysis<br/>+ Update Note]:::db
+    sse_event[SSE Completion<br/>token / complete / error]:::backend
+
+    note --> job
+    job --> exact
+    exact -- miss --> similar
+    similar -- miss --> gemini
+    exact -- hit --> persist
+    similar -- safe hit --> persist
+
+    gemini --> parse
+    parse --> schema
+    schema -- valid --> evidence
+    schema -- invalid --> retry
+    retry -- attempt 2 --> gemini
+    retry -- max attempts --> sse_event
+
+    evidence -- verified --> persist
+    evidence -- fabricated --> persist
+
+    persist --> sse_event
+```
+
+### Data Model — Firestore
+
+```mermaid
+erDiagram
+    notes ||--o{ analyses : "has"
+    notes ||--o{ analysis_jobs : "has"
+    analyses ||--|| reviews : "has"
+    analysis_cache }|--|| analyses : "may_supply"
+    rate_limits }|--|| notes : "governs"
+
+    notes {
+        string id PK
+        string user_id
+        string raw_text
+        string pseudonym
+        string visit_date
+        datetime created_at
+        string latest_analysis_id FK
+        string analysis_job_id FK
+        string review_status
+        int condition_count
+    }
+
+    analyses {
+        string id PK
+        string note_id FK
+        string user_id
+        array conditions
+        array gaps
+        string summary
+        string model_version
+        string prompt_version
+        datetime created_at
+        boolean is_failed
+        string failure_reason
+    }
+
+    reviews {
+        string id PK "= analysis_id"
+        string analysis_id FK
+        string note_id FK
+        string user_id
+        array conditions
+        array gaps
+        string reviewer_notes
+        datetime created_at
+        datetime updated_at
+    }
+
+    analysis_jobs {
+        string id PK
+        string note_id FK
+        string user_id
+        string status
+        string analysis_id FK
+        string error_message
+        string error_reason
+    }
+
+    analysis_cache {
+        string id PK "SHA-256 hash"
+        array conditions
+        array gaps
+        string summary
+        string model_version
+        string prompt_version
+        array buckets
+        array signature
+        array shingles
+        datetime expires_at
+    }
+
+    rate_limits {
+        string id PK "{user_id}:{window_start}"
+        string user_id
+        datetime window_start
+        int count
+    }
+```
+
+| Collection | Key Fields | Scope | Description |
+|---|---|---|---|
+| `notes` | id, user_id, raw_text, pseudonym, visit_date, created_at, latest_analysis_id, analysis_job_id, review_status, condition_count | Per-user | Clinical note and its current state |
+| `analyses` | id, note_id, user_id, conditions, gaps, summary, model_version, prompt_version, created_at, is_failed, failure_reason | Per-user | Immutable AI-generated analysis |
+| `reviews` | id (= analysis_id), analysis_id, note_id, user_id, conditions, gaps, reviewer_notes, created_at, updated_at | Per-user | Clinician review of an analysis |
+| `analysis_jobs` | id, note_id, user_id, status, analysis_id, error_message, error_reason | Per-user | Async job lifecycle (pending → processing → completed/failed) |
+| `analysis_cache` | id (SHA-256 of note text), conditions, gaps, summary, model_version, prompt_version, buckets, signature, shingles, expires_at | Global | Exact and similar cache for Gemini results |
+| `rate_limits` | id (`{user_id}:{window_start}`), user_id, window_start, count | Per-user | Token-bucket-style rate limiting |
+
+**Relationships:**
+- A `Note` has zero or more `Analysis` documents over time. `latest_analysis_id` points to the most recent one.
+- Each `Analysis` has at most one `Review` (deterministic document ID = `analysis_id`).
+- An `AnalysisJob` links a note to its in-flight analysis and drives the SSE stream.
+- `analysis_cache` entries are not scoped to any user; they key off raw note text only.
+
+**Why `Analysis` and `Review` are separate:**
+`Analysis` documents are immutable. Once persisted, they are never updated. This preserves the original AI output for auditability, correction metrics, and reanalysis comparisons. `Review` documents are separate and mutable, allowing clinicians to accept, edit, reject, or add conditions without altering the source analysis.
+
+## AI / LLM Pipeline
+
+1. **Prompt loading** — `backend/app/prompts/analysis_prompt.txt` (version `v1`) is loaded once at `GeminiClient` initialization. The `{note_text}` placeholder is replaced with the raw clinical note.
+2. **Gemini request** — `temperature=0.2`. The model is called via `generate_content` (single-call path) or `generate_content_stream` (streaming path).
+3. **Response format** — Gemini is instructed to emit a prose `SUMMARY:` block followed by a `DATA:` block containing a single JSON object.
+4. **JSON parsing** — Markdown fences are stripped, the payload after `DATA:` is extracted, and `json.loads()` is called.
+5. **Pydantic validation** — The parsed object is validated against `GeminiRawResponse`, which enforces:
+   - Max 50 conditions and 50 gaps
+   - Unique condition names (case-insensitive, whitespace-insensitive)
+   - `related_condition` in gaps must reference an existing condition name
+   - Valid `documentation_status` enum values
+6. **Evidence quote verification** — Each `evidence_quote` is checked for exact or NFC-normalized containment in the source note. Quotes shorter than 3 non-whitespace characters are rejected as unverified.
+7. **Retry on invalid output** — If validation fails, a `CORRECTION REQUIRED` prompt is built with a truncated safe error summary and sent to Gemini. Maximum 2 attempts total.
+8. **Final persistence** — Verified conditions are converted to immutable `Condition` objects with `quote_verified` set. An `Analysis` document is persisted, the note's `latest_analysis_id` is updated, and the job is marked completed.
+
+**Important:** LLM output is treated as untrusted input. Every response is validated against the schema, evidence quotes are verified against the source text, and failures are handled safely without exposing raw model output or internal errors to the client.
+
+## AI Safety / Robustness
+
+- **Structured schema validation** — All Gemini output is validated against `GeminiRawResponse`. Invalid structure, duplicate conditions, or missing required fields cause immediate rejection.
+- **Fabricated evidence detection** — `quote_verified` is computed for every condition. Quotes not found in the source note are marked `False` but preserved so clinicians can see exactly what the model produced.
+- **Invalid-output retry** — Schema or JSON failures trigger a single retry with a `CORRECTION REQUIRED` prompt that includes a safe, truncated error summary (no note text or clinical content).
+- **Malformed-output failure handling** — Empty responses, malformed JSON, missing `DATA:` markers, and schema violations are all classified as `invalid_output` and fail safely.
+- **Prompt-injection-like output rejection** — If Gemini returns non-structured output (e.g., plain text following an injection-like instruction in the note), the response fails schema validation and is rejected. The system does not attempt to detect injection text explicitly; it relies on strict output validation regardless of input content.
+- **Safe error handling** — User-facing error messages are generic. Internal details (Firestore errors, Gemini exceptions, validation tracebacks) are logged server-side only.
+- **No clinical content in logs** — Logs contain only structural metrics (counts, character counts, timing, token counts). Note text, prompt contents, patient identifiers, evidence quotes, summaries, and API secrets are never logged.
+
+## Human Review
+
+Clinicians can review each AI-generated analysis and submit corrections:
+
+| Action | Meaning |
+|---|---|
+| `accepted` | Condition is correct as generated |
+| `edited` | Condition was modified (name, quote, status, ICD-10) |
+| `rejected` | Condition should not be included |
+| `added` | Clinician-added condition not present in the AI output |
+
+The review also includes documentation gaps (editable) and optional reviewer notes.
+
+**Why the original AI output is preserved:**
+The original `Analysis` document is immutable. This creates an auditable record of what the model produced, enables correction-rate metrics, and allows reanalysis without destroying prior results. The separate `Review` document captures the clinician's interpretation at a point in time.
+
+## Authentication & Data Isolation
+
+- **Firebase ID tokens** — Every protected endpoint requires a valid Firebase ID token in the `Authorization: Bearer` header. Tokens are verified using `firebase_admin.auth.verify_id_token` with configurable revoked-token checking.
+- **Per-user ownership** — All Firestore reads filter by `user_id`. Create/update transactions verify that the target resource belongs to the requesting user before proceeding.
+- **Rate limiting** — Per-user, per-window request counts are tracked in Firestore transactions. Rate-limit check failures are fail-open to avoid blocking the core analysis flow when infrastructure hiccups.
+
+## API Overview
+
+| Method | Endpoint | Purpose | Authentication |
+|---|---|---|---|
+| `GET` | `/health` | Liveness probe | Public |
+| `GET` | `/auth/me` | Return current user profile | Required |
+| `POST` | `/notes` | Create a note and enqueue analysis | Required + Rate limited |
+| `GET` | `/notes` | List current user's notes (newest first) | Required |
+| `GET` | `/notes/{id}` | Get note with latest analysis and review | Required |
+| `POST` | `/notes/{id}/analyze` | Re-analyze an existing note | Required + Rate limited |
+| `GET` | `/notes/{id}/analysis/stream` | SSE stream for analysis progress | Required |
+| `GET` | `/analyses/{id}` | Get analysis with optional review | Required |
+| `POST` | `/analyses/{id}/reviews` | Create a review | Required |
+| `PUT` | `/analyses/{id}/reviews` | Update a review | Required |
+| `GET` | `/metrics/conditions` | Get per-user correction metrics | Required |
+
+## Local Development
+
+### Prerequisites
+- Python 3.11
+- Node.js 20
+- A Firebase project with Firestore and Authentication enabled
+- A Google Gemini API key
+
+### Backend
+
+```bash
+cd backend
+
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+Copy `backend/.env.example` to `backend/.env` and fill in the required variables (see Environment Variables below).
+
+Run the API:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+The API is available at `http://localhost:8000`.
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+```
+
+Copy `frontend/.env.example` to `frontend/.env` and fill in the Firebase and API base URL variables (see Environment Variables below).
+
+Run the development server:
+
+```bash
+npm run dev
+```
+
+The frontend is available at `http://localhost:5173`.
+
+### Firebase Setup
+
+Create a Firebase project, enable Authentication and Firestore, and download a service account key file for the backend. The service account path is optional if your environment provides Application Default Credentials.
+
+## Environment Variables
+
+### Backend (`backend/.env`)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GEMINI_API_KEY` | Yes | — | Google Gemini API key |
+| `GEMINI_MODEL` | No | `gemini-3.6-flash` | Model identifier |
+| `FIREBASE_PROJECT_ID` | Yes | — | Firebase project ID |
+| `FIREBASE_SERVICE_ACCOUNT_PATH` | No | — | Path to service account JSON; omit to use Application Default Credentials |
+| `ENVIRONMENT` | No | `development` | Runtime environment |
+| `ALLOWED_ORIGINS` | No | `http://localhost:5173` | Comma-separated allowed CORS origins |
+| `RATE_LIMIT_MAX_REQUESTS` | No | `30` | Max analysis requests per user per window |
+| `RATE_LIMIT_WINDOW_SECONDS` | No | `3600` | Rate limit window in seconds |
+| `ANALYSIS_TIMEOUT_SECONDS` | No | `60` | Maximum analysis duration in seconds |
+| `FIREBASE_CHECK_REVOKED_TOKENS` | No | `true` | Reject revoked Firebase ID tokens |
+
+### Frontend (`frontend/.env`)
+
+| Variable | Required | Description |
+|---|---|---|
+| `VITE_API_BASE_URL` | Yes | Backend API base URL |
+| `VITE_FIREBASE_API_KEY` | Yes | Firebase public API key |
+| `VITE_FIREBASE_AUTH_DOMAIN` | Yes | Firebase authentication domain |
+| `VITE_FIREBASE_PROJECT_ID` | Yes | Firebase project ID |
+| `VITE_FIREBASE_APP_ID` | Yes | Firebase application ID |
+
+## Testing & Quality
+
+### Backend
+
+```bash
+cd backend
+pytest tests
+mypy .
+ruff check .
+```
+
+Verified results:
+- **276 tests passed** (pytest, with mocked Firebase/Firestore/Gemini)
+- **mypy** — 0 errors in 41 source files
+- **ruff** — 0 errors
+
+### Frontend
+
+```bash
+cd frontend
+npm run test -- --run
+npx tsc --noEmit
+npm run lint
+npm run build
+```
+
+Verified results:
+- **66 tests passed** (vitest + React Testing Library)
+- **TypeScript** — clean
+- **ESLint** — clean
+- **Production build** — successful
+
+## GitHub Actions
+
+The CI workflow (`.github/workflows/ci.yml`) runs on every push and pull request to `main`.
+
+**Backend job** (`ubuntu-latest`, Python 3.11):
+1. `pip install -r requirements.txt`
+2. `mypy .`
+3. `ruff check .`
+4. `pytest tests`
+
+**Frontend job** (`ubuntu-latest`, Node.js 20):
+1. `npm ci`
+2. `npx tsc --noEmit`
+3. `npm run lint`
+4. `npm run test -- --run`
+5. `npm run build`
+
+## Sample Clinical Notes
+
+Synthetic notes for local testing are located in `sample-notes/`:
+
+- `sample-notes/well_documented.txt` — Short follow-up note with Type 2 diabetes and hypertension, clearly documented with active management.
+- `sample-notes/multi-condition.txt` — Longer CHF follow-up with additional knee complaint and prediabetes concerns, yielding multiple conditions and documentation gaps.
+- `sample-notes/ambiguous.txt` — General checkup with vague language, useful for testing ambiguous documentation status and gap detection.
+
+These notes are synthetic and contain no real patient identifiers.
+
+## Gemini Prompt
+
+The analysis prompt is stored at:
+
+```
+backend/app/prompts/analysis_prompt.txt
+```
+
+It is versioned in code as `PROMPT_VERSION = "v1"` and loaded once at `GeminiClient` initialization. The prompt defines:
+- Condition extraction rules (exclude family history, denied conditions, hypotheticals)
+- Evidence requirements (verbatim quotes, no paraphrasing)
+- Documentation status rules (`well_documented`, `ambiguous`, `mentioned_without_assessment_or_plan`)
+- Documentation gap rules (specific, actionable, non-duplicate)
+- Privacy requirements (no patient identifiers in output)
+- Empty/invalid note handling
+- The required `SUMMARY:` / `DATA:` output format with embedded JSON schema
+
+## Design Decisions
+
+### 1. Immutable Analysis + Separate Review
+- **Problem:** Clinicians need to correct AI output, but the original model result must remain available for audit and metrics.
+- **Alternative considered:** Update analysis documents in place when a review is submitted.
+- **Decision:** Store immutable `Analysis` documents. Create separate `Review` documents for clinician corrections.
+- **Why:** Preserves the original AI output unchanged. Enables reanalysis without destroying prior results. Supports correction-rate metrics by keeping the source and review distinct.
+
+### 2. Exact Cache + Similarity Cache
+- **Problem:** Re-running Gemini on identical or near-identical notes wastes time and cost.
+- **Alternative considered:** No caching, or exact-match cache only.
+- **Decision:** Two-tier cache — exact SHA-256 match first, then LSH/MinHash similarity lookup with conservative safety checks (evidence quote validity, meaningful-change detection, 0.95 Jaccard threshold).
+- **Why:** Exact cache eliminates redundant Gemini calls for identical notes. Similarity cache extends savings to near-duplicates while safety checks prevent unsafe reuse when medically meaningful changes are present.
+
+### 3. Provider-Aware Retry
+- **Problem:** Gemini returns `429 RESOURCE_EXHAUSTED` with a suggested retry delay; fixed backoff wastes quota and increases latency.
+- **Alternative considered:** Fixed exponential backoff for all errors.
+- **Decision:** Parse the provider-suggested delay from the 429 error message (e.g., `Please retry in 15.44s`), cap at 30 seconds, and fall back to 1 second when the delay cannot be parsed.
+- **Why:** Respects the provider's quota recovery guidance while bounding worst-case user wait time. Non-429 errors retain the existing retry behavior.
+
+### 4. Evidence Quote Verification
+- **Problem:** Gemini may fabricate evidence quotes that do not appear in the source note.
+- **Alternative considered:** Trust Gemini output or rely on schema validation alone.
+- **Decision:** Verify every `evidence_quote` against the source note using exact containment and NFC-normalized containment. Mark unverified quotes with `quote_verified=False` but preserve them in the result.
+- **Why:** Schema validation ensures structure but cannot detect fabricated text content. This check flags hallucinated quotes for clinician awareness without silently dropping conditions.
+
+## Limitations / Trade-offs
+
+- **Plain-text notes only** — Input is limited to raw text (≤20,000 characters, ≤6,000 words). PDF, image, or other non-text formats are not supported.
+- **Global analysis cache** — The `analysis_cache` collection is intentionally user-agnostic. Cache keys are derived from note-content SHA-256 + prompt version + Gemini model; raw note text and user identifiers are not stored. Cached AI output can therefore be reused across users for identical content. Before a cached result is persisted, evidence quotes are re-verified against the current user's note text. This is a deliberate design trade-off: it maximizes cache reuse and reduces Gemini cost, at the expense of cross-user result sharing for identical clinical content.
+- **Conservative similarity lexicons** — The meaningful-change detector uses seed lists for medications, allergies, diagnoses, negations, and demographic terms. These are intentionally conservative and not exhaustive medical ontologies.
+- **Narrow PHI guards** — The pseudonym field rejects common identifier patterns (9-digit numbers, email addresses, phone numbers). Full PHI detection is not implemented.
+- **Fail-open rate limiting** — If Firestore rate-limit infrastructure fails, the request proceeds rather than blocking the user. Gemini's own 429 handling provides a second layer of defense.
+
+## What I Would Build With One More Week
+
+1. **Streaming summary UX improvements** — Refine how progressive summary chunks are rendered in the UI to reduce perceived latency and improve readability during analysis.
+2. **Per-user analysis cache scoping** — Add user-scoped cache namespacing to the existing two-tier cache, eliminating cross-user result sharing while preserving exact-hit performance.
+3. **Clinician correction metrics dashboard** — Build a frontend view for the existing `/metrics/conditions` endpoint to visualize accepted, edited, rejected, and added conditions over time.
+4. **PDF/image note upload with extraction** — Extend the input pipeline beyond plain text by adding client-side extraction (e.g., PDF.js, OCR) so clinicians can paste or upload documents directly.
+5. **Accessibility and mobile responsiveness** — Improve layout, focus management, and ARIA semantics so the review interface works reliably on tablets and assistive technologies.
+
+## What Is Knowingly Unfinished
+
+There are no incomplete or stub implementations in the repository. The codebase contains no `TODO`, `FIXME`, or unfinished feature markers.
+
+The items listed in **Limitations / Trade-offs** are deliberate scope decisions, not unfinished work:
+- Plain-text-only input
+- Global (cross-user) analysis cache
+- Conservative similarity lexicons
+- Narrow PHI guards
+- Fail-open rate limiting
+
+All implemented features are complete and covered by automated tests.
+
+## Deployment
+
+No public deployment is currently configured. The application is designed for local development only.
+
+## Assessment Duration
+
+~ 26 hrs
+
+## Privacy & Security
+
+- **Firebase ID token verification** — All protected endpoints verify Firebase ID tokens with configurable revoked-token checking.
+- **Per-user Firestore ownership checks** — Every data access is scoped to the authenticated user. Transactions verify ownership before writes.
+- **Input and PHI guards** — Note text is validated for length and word count. The pseudonym field rejects common identifier patterns (9-digit numbers, emails, phone numbers).
+- **Evidence verification** — Every evidence quote is verified against the source note; fabricated quotes are flagged.
+- **Safe logging** — No clinical note text, prompt contents, patient identifiers, evidence quotes, summaries, or API secrets are written to logs. Only structural metrics (counts, sizes, timing) are logged.
+- **Secrets server-side** — Gemini API keys and Firebase service account credentials are kept in backend environment variables and never exposed to the frontend.
+- **CORS** — Restricted to the origins listed in `ALLOWED_ORIGINS`.
+- **Synthetic data** — Development and testing use synthetic sample notes with no real patient identifiers.
