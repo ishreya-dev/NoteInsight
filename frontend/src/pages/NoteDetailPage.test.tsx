@@ -112,6 +112,59 @@ describe("NoteDetailPage header navigation", () => {
     expect(mockNavigate).toHaveBeenCalledWith("/history");
   });
 
+  it("shows streamed conditions after the SSE complete event", async () => {
+    const streamingNote = { ...mockNote, analysis_job_id: "job-1" };
+    const completedAnalysis = {
+      ...mockAnalysis,
+      id: "a-complete",
+      conditions: [
+        {
+          id: "c1",
+          condition_name: "Condition One",
+          evidence_quote: "Patient has condition 1.",
+          documentation_status: "ambiguous" as const,
+          suggested_icd10: "ICD-1",
+          confidence: 0.9,
+          quote_verified: true,
+        },
+      ],
+    };
+
+    vi.mocked(api.getNote).mockResolvedValue({
+      note: streamingNote,
+      analysis: null,
+      review: null,
+    });
+
+    let completeHandler:
+      | ((result: { note_id: string; analysis: typeof completedAnalysis }) => void)
+      | undefined;
+    vi.mocked(api.streamAnalysis).mockImplementation(
+      async (_noteId, handlers) => {
+        completeHandler = handlers.onComplete;
+        return undefined;
+      },
+    );
+
+    render(<NoteDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Summary" })).toBeInTheDocument();
+    });
+
+    expect(completeHandler).toBeDefined();
+    completeHandler!({ note_id: "n1", analysis: completedAnalysis });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Conditions \(1\)/)).toBeInTheDocument();
+    });
+
+    expect(
+      screen.getByDisplayValue("Condition One"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Conditions \(0\)/)).not.toBeInTheDocument();
+  });
+
   it("does not introduce a new note creation flow", async () => {
     vi.mocked(api.getNote).mockResolvedValue({
       note: { ...mockNote, analysis_job_id: "job-1" },

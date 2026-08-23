@@ -183,6 +183,7 @@ export default function NoteDetailPage() {
 
       {(analysis || isStreaming) && !analysis?.is_failed && (
         <AnalysisReview
+          key={analysis?.id ?? undefined}
           analysis={analysis ?? null}
           existingReview={review}
           onSaved={setReview}
