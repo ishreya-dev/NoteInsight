@@ -8,8 +8,8 @@ google-genai
 
 python-dotenv
 
-pytest
+pytest==9.1.1
 pytest-asyncio
 httpx
-mypy
-ruff
+mypy==2.2.0
+ruff==0.15.20

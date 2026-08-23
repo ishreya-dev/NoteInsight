@@ -41,44 +41,29 @@ flowchart LR
     classDef db fill:#f3e5f5,stroke:#7b1fa2,color:#4a148c
     classDef security fill:#ffebee,stroke:#c62828,color:#b71c1c
 
-    user[Clinician]:::frontend
+    User["Clinician"]:::frontend
+    Frontend["React + Vite"]:::frontend
+    Auth["Firebase Authentication"]:::security
+    API["FastAPI Backend"]:::backend
+    Notes["Notes API"]:::backend
+    Reviews["Review API"]:::backend
+    Jobs["Analysis Jobs"]:::backend
+    Cache["Analysis Cache"]:::backend
+    Firestore["Firestore"]:::db
+    Gemini["Gemini"]:::ai
+    SSE["SSE Analysis Stream"]:::backend
 
-    subgraph Frontend [React + Vite Frontend]
-        login[LoginPage]:::frontend
-        newnote[NewNotePage]:::frontend
-        detail[NoteDetailPage<br/>SSE + Review UI]:::frontend
-        history[HistoryPage]:::frontend
-    end
-
-    subgraph Backend [FastAPI Backend]
-        api[REST API<br/>/auth /notes /analyses /metrics]:::backend
-        sse[Analysis Stream<br/>SSE Endpoint]:::backend
-        authdep[Firebase Auth<br/>Dependency]:::security
-    end
-
-    subgraph Data [Firestore]
-        firestore[(notes / analyses<br/>reviews / jobs<br/>cache / rate_limits)]:::db
-    end
-
-    subgraph AI [Gemini]
-        gemini[generate_content<br/>generate_content_stream]:::ai
-    end
-
-    user --> login
-    login --> newnote
-    newnote --> detail
-    detail --> history
-
-    user -- Bearer token --> authdep
-    authdep --> api
-
-    api --> firestore
-    sse --> firestore
-
-    api -- REST / SSE --> user
-
-    sse -- stream call --> gemini
-    gemini -- tokens / JSON --> sse
+    User --> Frontend
+    Frontend --> Auth
+    Frontend --> API
+    API --> Notes
+    API --> Reviews
+    API --> Jobs
+    API --> Cache
+    API --> Firestore
+    API --> Gemini
+    API --> SSE
+    SSE --> Frontend
 ```
 
 ### LLD — AI Analysis Pipeline
