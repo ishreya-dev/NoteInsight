@@ -110,4 +110,8 @@ Desktop.ini
 *.temp
 *.swp
 *.swo
+
 *~
+
+# Firebase local state
+.firebase/

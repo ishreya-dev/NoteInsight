@@ -32,7 +32,10 @@ class Settings:
             default="development",
         )
         self.allowed_origins = self._parse_origins(
-            os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+            os.getenv(
+                "ALLOWED_ORIGINS",
+                "http://localhost:5173,https://notesinsight-cfa98.web.app",
+            )
         )
 
         self.rate_limit_max_requests = self._optional_int(

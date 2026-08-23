@@ -480,6 +480,32 @@ The items listed in **Limitations / Trade-offs** are deliberate scope decisions,
 
 All implemented features are complete and covered by automated tests.
 
+## Deployment & DevOps
+
+### Deployment
+
+- Frontend: React + Vite deployed using Firebase Hosting
+- Backend: FastAPI deployed on Render
+- Authentication: Firebase Authentication
+- Database: Cloud Firestore
+- AI service: Google Gemini
+- Frontend URL: https://notesinsight-cfa98.web.app
+- Backend URL: https://noteinsight-backend.onrender.com
+
+### DevOps / CI-CD
+
+GitHub Actions is used for CI/CD and currently validates:
+
+- Backend mypy
+- Backend Ruff
+- Backend pytest
+- Frontend TypeScript
+- Frontend ESLint
+- Frontend Vitest tests
+- Frontend production build
+
+Environment variables and secrets are managed through the deployment platforms and are not committed to Git.
+
 ## Deployment
 
 No public deployment is currently configured. The application is designed for local development only.
