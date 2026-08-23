@@ -52,7 +52,7 @@ flowchart LR
 
     subgraph Backend [FastAPI Backend]
         api[REST API<br/>/auth /notes /analyses /metrics]:::backend
-        sse[/notes/{id}/analysis/stream<br/>SSE Endpoint/]:::backend
+        sse[Analysis Stream<br/>SSE Endpoint]:::backend
         authdep[Firebase Auth<br/>Dependency]:::security
     end
 

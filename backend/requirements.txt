@@ -11,3 +11,5 @@ python-dotenv
 pytest
 pytest-asyncio
 httpx
+mypy
+ruff
