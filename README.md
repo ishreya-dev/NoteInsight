@@ -506,10 +506,6 @@ GitHub Actions is used for CI/CD and currently validates:
 
 Environment variables and secrets are managed through the deployment platforms and are not committed to Git.
 
-## Deployment
-
-No public deployment is currently configured. The application is designed for local development only.
-
 ## Assessment Duration
 
 ~ 26 hrs
