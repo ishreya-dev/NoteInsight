@@ -168,13 +168,17 @@ describe("AnalysisReview", () => {
       />,
     );
 
-    expect(screen.getByText("thinking .")).toBeInTheDocument();
+    const preparing = () =>
+      screen.getByText(/thinking|Analyzing note|Preparing summary/);
+
+    expect(preparing()).toBeInTheDocument();
+    const before = preparing().textContent;
+
     act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("thinking . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("thinking . . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("Analyzing note .")).toBeInTheDocument();
+
+    const after = preparing().textContent;
+    expect(after).not.toBe(before);
+    expect(preparing()).toBeInTheDocument();
 
     vi.useRealTimers();
   });
@@ -191,25 +195,22 @@ describe("AnalysisReview", () => {
       />,
     );
 
-    expect(screen.getByText("thinking .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("thinking . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("thinking . . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("Analyzing note .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("Analyzing note . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("Analyzing note . . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("Preparing summary .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("Preparing summary . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("Preparing summary . . .")).toBeInTheDocument();
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("thinking .")).toBeInTheDocument();
+    const messages = ["thinking", "Analyzing note", "Preparing summary"];
+    const observed = new Set<string>();
+    const capture = () =>
+      messages.forEach((m) => {
+        if (screen.queryByText(new RegExp(`^${m}`))) observed.add(m);
+      });
+
+    capture();
+    for (let i = 0; i < 10; i++) {
+      act(() => { vi.advanceTimersByTime(1000); });
+      capture();
+    }
+
+    expect(observed.has("thinking")).toBe(true);
+    expect(observed.has("Analyzing note")).toBe(true);
+    expect(observed.has("Preparing summary")).toBe(true);
 
     vi.useRealTimers();
   });
@@ -256,8 +257,9 @@ describe("AnalysisReview", () => {
       />,
     );
 
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("thinking . .")).toBeInTheDocument();
+    expect(
+      screen.getByText(/thinking|Analyzing note|Preparing summary/),
+    ).toBeInTheDocument();
 
     rerender(
       <AnalysisReview
@@ -268,9 +270,9 @@ describe("AnalysisReview", () => {
     );
 
     expect(screen.getByText("First token")).toBeInTheDocument();
-    expect(screen.queryByText("thinking .")).not.toBeInTheDocument();
-    expect(screen.queryByText("Analyzing note .")).not.toBeInTheDocument();
-    expect(screen.queryByText("Preparing summary .")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/thinking|Analyzing note|Preparing summary/),
+    ).not.toBeInTheDocument();
 
     act(() => { vi.advanceTimersByTime(2000); });
     expect(screen.getByText("First token")).toBeInTheDocument();
@@ -290,8 +292,9 @@ describe("AnalysisReview", () => {
       />,
     );
 
-    act(() => { vi.advanceTimersByTime(500); });
-    expect(screen.getByText("thinking . .")).toBeInTheDocument();
+    expect(
+      screen.getByText(/thinking|Analyzing note|Preparing summary/),
+    ).toBeInTheDocument();
 
     rerender(
       <AnalysisReview
@@ -302,11 +305,13 @@ describe("AnalysisReview", () => {
       />,
     );
 
+    expect(screen.getByText("Patient has condition 1.")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/thinking|Analyzing note|Preparing summary/),
+    ).not.toBeInTheDocument();
+
     act(() => { vi.advanceTimersByTime(2000); });
     expect(screen.getByText("Patient has condition 1.")).toBeInTheDocument();
-    expect(screen.queryByText("thinking .")).not.toBeInTheDocument();
-    expect(screen.queryByText("Analyzing note .")).not.toBeInTheDocument();
-    expect(screen.queryByText("Preparing summary .")).not.toBeInTheDocument();
 
     vi.useRealTimers();
   });

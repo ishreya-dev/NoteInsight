@@ -672,7 +672,9 @@ class GeminiClient:
             )
             if stream is not None:
                 try:
-                    await stream.aclose()
+                    aclose = getattr(stream, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
                 except Exception:
                     pass
 

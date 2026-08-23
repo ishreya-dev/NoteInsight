@@ -5,6 +5,7 @@ Stubs provider SDKs so tests run without live Firebase, Firestore, or Gemini.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+
+from app.services.firestore_client import FirestoreClient
 
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("FIREBASE_PROJECT_ID", "demo-project")
@@ -45,34 +48,34 @@ for module_name in (
     _ensure_module(module_name)
 
 firestore_mod = sys.modules["google.cloud.firestore"]
-firestore_mod.Query = MagicMock(DESCENDING="DESCENDING")
-firestore_mod.async_transactional = lambda fn: fn
+firestore_mod.Query = MagicMock(DESCENDING="DESCENDING")  # type: ignore[attr-defined]
+firestore_mod.async_transactional = lambda fn: fn  # type: ignore[attr-defined]
 
-sys.modules["google.cloud.firestore_v1.base_query"].FieldFilter = MagicMock
-sys.modules["google.cloud.firestore_v1.async_client"].AsyncClient = MagicMock
+sys.modules["google.cloud.firestore_v1.base_query"].FieldFilter = MagicMock  # type: ignore[attr-defined]
+sys.modules["google.cloud.firestore_v1.async_client"].AsyncClient = MagicMock  # type: ignore[attr-defined]
 
 firebase_admin = sys.modules["firebase_admin"]
-firebase_admin.get_app = MagicMock(return_value=MagicMock())
-firebase_admin.initialize_app = MagicMock(return_value=MagicMock())
-firebase_admin.credentials = sys.modules["firebase_admin.credentials"]
-firebase_admin.exceptions = sys.modules["firebase_admin.exceptions"]
-firebase_admin.auth = sys.modules["firebase_admin.auth"]
-sys.modules["firebase_admin.credentials"].Certificate = MagicMock()
-sys.modules["firebase_admin.credentials"].ApplicationDefault = MagicMock()
-sys.modules["firebase_admin.auth"].FirebaseError = type(
+firebase_admin.get_app = MagicMock(return_value=MagicMock())  # type: ignore[attr-defined]
+firebase_admin.initialize_app = MagicMock(return_value=MagicMock())  # type: ignore[attr-defined]
+firebase_admin.credentials = sys.modules["firebase_admin.credentials"]  # type: ignore[attr-defined]
+firebase_admin.exceptions = sys.modules["firebase_admin.exceptions"]  # type: ignore[attr-defined]
+firebase_admin.auth = sys.modules["firebase_admin.auth"]  # type: ignore[attr-defined]
+sys.modules["firebase_admin.credentials"].Certificate = MagicMock()  # type: ignore[attr-defined]
+sys.modules["firebase_admin.credentials"].ApplicationDefault = MagicMock()  # type: ignore[attr-defined]
+sys.modules["firebase_admin.auth"].FirebaseError = type(  # type: ignore[attr-defined]
     "FirebaseError",
     (Exception,),
     {},
 )
-sys.modules["firebase_admin.exceptions"].FirebaseError = type(
+sys.modules["firebase_admin.exceptions"].FirebaseError = type(  # type: ignore[attr-defined]
     "FirebaseError",
     (Exception,),
     {},
 )
-sys.modules["firebase_admin.auth"].verify_id_token = MagicMock()
+sys.modules["firebase_admin.auth"].verify_id_token = MagicMock()  # type: ignore[attr-defined]
 
-sys.modules["google.genai"].Client = MagicMock()
-sys.modules["google.genai.types"].GenerateContentConfig = MagicMock()
+sys.modules["google.genai"].Client = MagicMock()  # type: ignore[attr-defined]
+sys.modules["google.genai.types"].GenerateContentConfig = MagicMock()  # type: ignore[attr-defined]
 
 
 # ---- Shared domain builders for API tests ----
@@ -182,12 +185,13 @@ def make_analysis_result() -> AnalysisResult:
 
 @pytest.fixture
 def db() -> AsyncMock:
-    mock = AsyncMock()
+    mock = AsyncMock(spec=FirestoreClient)
     mock.create_note = AsyncMock()
     mock.get_note = AsyncMock()
     mock.list_notes = AsyncMock(return_value=[])
     mock.get_analysis = AsyncMock()
     mock.get_review_for_analysis = AsyncMock(return_value=None)
+    mock.get_cached_analysis_result = AsyncMock(return_value=None)
     mock.persist_analysis_for_note = AsyncMock()
     mock.create_analysis_job = AsyncMock()
     mock.claim_analysis_job = AsyncMock(return_value="claimed")
@@ -200,11 +204,10 @@ def db() -> AsyncMock:
 @pytest.fixture
 def gemini() -> AsyncMock:
     mock = AsyncMock()
-    mock.analyze_note = AsyncMock(return_value=make_analysis_result())
 
     async def _stream_analyze_note(*args, **kwargs):
-        return
-        yield  # pragma: no cover
+        yield "SUMMARY: Follow-up visit.\n"
+        yield 'DATA:{"conditions": [], "gaps": [], "summary": "Follow-up visit."}'
 
     mock.stream_analyze_note = _stream_analyze_note
     return mock
@@ -220,3 +223,23 @@ def client(db: AsyncMock, gemini: AsyncMock):
         yield test_client
 
     app.dependency_overrides.clear()
+
+
+def _parse_sse(text: str):
+    events = []
+    for block in text.strip().split("\n\n"):
+        if not block.strip():
+            continue
+        etype = ""
+        edata = ""
+        for line in block.strip().split("\n"):
+            if line.startswith("event: "):
+                etype = line[7:]
+            elif line.startswith("data: "):
+                edata = line[6:]
+        try:
+            parsed = json.loads(edata) if edata else None
+        except json.JSONDecodeError:
+            parsed = edata or None
+        events.append({"event": etype, "data": parsed})
+    return events

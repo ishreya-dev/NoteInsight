@@ -8,6 +8,8 @@ error and exit WITHOUT modifying the job state.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import MutableMapping, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,10 +30,10 @@ def _make_request_scope() -> dict:
     }
 
 
-def _make_receive() -> object:
+def _make_receive() -> Callable[[], Awaitable[MutableMapping[str, object]]]:
     """ASGI receive; Starlette uses this for disconnect detection only."""
 
-    async def receive():
+    async def receive() -> MutableMapping[str, object]:
         return {"type": "http.request", "body": b"", "more_body": False}
 
     return receive
@@ -57,7 +59,7 @@ def _make_connected_request(scope: dict, monkeypatch: pytest.MonkeyPatch) -> Req
 
     # Direct instance-attribute assignment works because Python's attribute
     # lookup checks the instance dict before the class.
-    request.is_disconnected = always_connected
+    monkeypatch.setattr(request, "is_disconnected", always_connected)
     return request
 
 
@@ -91,7 +93,7 @@ async def test_polling_timeout_emits_error(
         settings=settings,
     )
 
-    iterator = response.body_iterator
+    iterator = cast(AsyncIterator[str], response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -135,7 +137,7 @@ async def test_polling_timeout_does_not_modify_job(
         settings=settings,
     )
 
-    iterator = response.body_iterator
+    iterator = cast(AsyncIterator[str], response.body_iterator)
     try:
         while True:
             await iterator.__anext__()
@@ -175,7 +177,7 @@ async def test_polling_completes_before_timeout(
         settings=settings,
     )
 
-    iterator = response.body_iterator
+    iterator = cast(AsyncIterator[str], response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -218,7 +220,7 @@ async def test_polling_disconnect_still_exits(
         settings=settings,
     )
 
-    iterator = response.body_iterator
+    iterator = cast(AsyncIterator[str], response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -261,7 +263,7 @@ async def test_polling_limit_is_derived_from_settings(
         settings=settings,
     )
 
-    iterator = response.body_iterator
+    iterator = cast(AsyncIterator[str], response.body_iterator)
     try:
         while True:
             await iterator.__anext__()
@@ -274,3 +276,43 @@ async def test_polling_limit_is_derived_from_settings(
     assert 20 <= db.get_analysis_job.await_count <= 30, (
         f"Expected ~25 polls, got {db.get_analysis_job.await_count}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout,expected_polls", [
+    (0.39, 2),
+    (0.4, 2),
+    (0.79, 2),
+    (0.8, 3),
+])
+async def test_polling_boundary_clamps_min_polls(
+    db: AsyncMock,
+    gemini: AsyncMock,
+    timeout: float,
+    expected_polls: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    note = make_note(note_id="n1").model_copy(update={"analysis_job_id": "job-1"})
+    db.get_note.return_value = note
+    db.get_analysis_job.return_value = _make_processing_job(note.user_id)
+    settings = MagicMock(analysis_timeout_seconds=timeout, gemini_model="gemini-test")
+
+    request = _make_connected_request(_make_request_scope(), monkeypatch)
+
+    response = await notes_router.stream_analysis(
+        note.id,
+        request,
+        current_user=TEST_USER,
+        db=db,
+        gemini=gemini,
+        settings=settings,
+    )
+
+    iterator = cast(AsyncIterator[str], response.body_iterator)
+    try:
+        while True:
+            await iterator.__anext__()
+    except StopAsyncIteration:
+        pass
+
+    assert db.get_analysis_job.await_count == expected_polls

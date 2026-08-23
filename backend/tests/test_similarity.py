@@ -1,4 +1,6 @@
 """Unit tests for the lexical near-duplicate similarity utilities."""
+import pytest
+
 from app.services.similarity import (
     DEFAULT_NUM_BANDS,
     MinHash,
@@ -37,7 +39,7 @@ def test_identical_text_has_unity_similarity_and_same_buckets():
 
 def test_one_word_changed_is_high_similarity_and_shares_buckets():
     sim = text_similarity(_SAMPLE, _SAMPLE_ONE_WORD)
-    assert sim > 0.7
+    assert sim == pytest.approx(0.78, abs=0.01)
     shared = set(compute_buckets(_SAMPLE)) & set(compute_buckets(_SAMPLE_ONE_WORD))
     assert len(shared) > 0
 
@@ -51,7 +53,7 @@ def test_whitespace_and_case_differences_are_ignored():
 
 
 def test_clearly_different_text_has_low_similarity():
-    assert text_similarity(_SAMPLE, _DIFFERENT) < 0.3
+    assert text_similarity(_SAMPLE, _DIFFERENT) == 0.0
 
 
 def test_bucket_generation_is_deterministic():
@@ -66,7 +68,7 @@ def test_jaccard_of_equal_sets_is_unity_and_disjoint_is_zero():
     a = build_shingles(tokenize(_SAMPLE))
     assert jaccard(a, a) == 1.0
     b = build_shingles(tokenize(_DIFFERENT))
-    assert jaccard(a, b) < 0.3
+    assert jaccard(a, b) == 0.0
 
 
 def test_minhash_signature_is_stable_and_length_matches():
@@ -85,12 +87,12 @@ def test_lexical_similarity_identical_notes_is_unity():
 
 def test_lexical_similarity_near_identical_is_high():
     shingles = list(build_shingles(tokenize(_SAMPLE)))
-    assert lexical_similarity(_SAMPLE_ONE_WORD, shingles) > 0.7
+    assert lexical_similarity(_SAMPLE_ONE_WORD, shingles) == pytest.approx(0.78, abs=0.01)
 
 
 def test_lexical_similarity_clearly_different_is_low():
     shingles = list(build_shingles(tokenize(_SAMPLE)))
-    assert lexical_similarity(_DIFFERENT, shingles) < 0.3
+    assert lexical_similarity(_DIFFERENT, shingles) == 0.0
 
 
 def test_lexical_similarity_missing_or_empty_shingles_is_zero():

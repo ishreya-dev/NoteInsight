@@ -7,7 +7,7 @@ un-analyzable note.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -108,11 +108,11 @@ def test_create_note_cleanup_failure_still_returns_safe_error(
     assert any("Failed to clean up orphaned note" in m for m in messages)
 
 
-def test_delete_note_owner_can_delete(
+@pytest.mark.asyncio
+async def test_delete_note_owner_can_delete(
     db: AsyncMock,
 ) -> None:
     """delete_note reads the note, confirms ownership, then deletes."""
-    from app.services.firestore_client import FirestoreClient
 
     # Simulate a note owned by the user.
     snapshot = AsyncMock()
@@ -125,11 +125,7 @@ def test_delete_note_owner_can_delete(
     # router calls db.delete_note(note_id=..., user_id=...).
     db.delete_note = AsyncMock()
 
-    async def run():
-        await db.delete_note(note_id="abc", user_id=TEST_USER.uid)
-
-    import asyncio
-    asyncio.run(run())
+    await db.delete_note(note_id="abc", user_id=TEST_USER.uid)
 
     db.delete_note.assert_awaited_once_with(note_id="abc", user_id=TEST_USER.uid)
 

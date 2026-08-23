@@ -21,6 +21,16 @@ def test_create_note_success(
 ) -> None:
     db.create_note.return_value = make_note()
 
+    stream_calls = 0
+
+    async def noop_stream(*_a, **_kw):
+        nonlocal stream_calls
+        stream_calls += 1
+        return
+        yield  # pragma: no cover
+
+    gemini.stream_analyze_note = noop_stream
+
     response = client.post(
         "/notes",
         json={
@@ -33,7 +43,7 @@ def test_create_note_success(
     body = response.json()
     assert body["note"]["analysis_job_id"] == body["job_id"]
     db.create_analysis_job.assert_awaited_once()
-    gemini.analyze_note.assert_not_awaited()
+    assert stream_calls == 0
 
 
 def test_create_note_creates_job_without_calling_gemini(
@@ -42,6 +52,16 @@ def test_create_note_creates_job_without_calling_gemini(
     gemini: AsyncMock,
 ) -> None:
     db.create_note.return_value = make_note()
+
+    stream_calls = 0
+
+    async def noop_stream(*_a, **_kw):
+        nonlocal stream_calls
+        stream_calls += 1
+        return
+        yield  # pragma: no cover
+
+    gemini.stream_analyze_note = noop_stream
 
     response = client.post(
         "/notes",
@@ -54,7 +74,7 @@ def test_create_note_creates_job_without_calling_gemini(
     body = response.json()
     assert body["job_id"]
     db.create_analysis_job.assert_awaited_once()
-    gemini.analyze_note.assert_not_awaited()
+    assert stream_calls == 0
 
 
 def test_reanalyze_updates_latest_analysis_pointer(
@@ -119,6 +139,19 @@ def test_list_notes_returns_history_items(
 
     assert response.status_code == 200
     assert len(response.json()["items"]) == 1
+
+
+def test_list_notes_returns_empty_list_when_no_notes(
+    client: TestClient,
+    db: AsyncMock,
+) -> None:
+    db.list_notes.return_value = []
+
+    response = client.get("/notes?limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == []
 
 
 def test_list_notes_returns_only_current_users_notes_newest_first(

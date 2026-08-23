@@ -1,25 +1,18 @@
 """Verification tests for the single-call streaming analysis flow."""
-import asyncio
 import json
-import os
-import sys
-from datetime import datetime, timezone
-from types import ModuleType
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
 
 from app.dependencies import get_current_user, get_firestore_client
 from app.models.analysis import Condition, DocumentationStatus
-from app.models.note import Note
 from app.models.user import AuthenticatedUser
 from app.services.analysis_jobs import _parse_streamed_response
 from app.services.gemini_client import GeminiAnalysisError, PROMPT_VERSION, get_gemini_client
 from app.services.similarity import build_shingles, tokenize
 from app.config import get_settings
-from tests.conftest import TEST_USER, make_analysis, make_note
+from tests.conftest import TEST_USER, make_note
 
 
 @pytest.fixture
@@ -121,14 +114,23 @@ class TestSingleCallStreaming:
     def test_actual_chunks_reach_sse(self, client_with_stream, valid_gemini):
         """Requirement: actual Gemini chunks reach the SSE stream."""
         response = client_with_stream.get("/notes/n1/analysis/stream")
-        text = response.text
-        token_events = [
-            data for etype, data in _parse_sse(text)
-            if etype == "token"
-        ]
+        events = _parse_sse(response.text)
+        token_events = [data for etype, data in events if etype == "token"]
+        complete_events = [data for etype, data in events if etype == "complete"]
+
         assert len(token_events) > 0
+        assert all("text" in e and e["text"] for e in token_events)
         token_text = "".join(e["text"] for e in token_events)
         assert "Patient has diabetes." in token_text
+
+        assert len(complete_events) == 1
+        assert complete_events[0]["analysis"]["summary"] == "Patient has diabetes."
+
+        token_indices = [i for i, (etype, _) in enumerate(events) if etype == "token"]
+        complete_indices = [i for i, (etype, _) in enumerate(events) if etype == "complete"]
+        assert token_indices, "expected at least one token event"
+        assert complete_indices, "expected exactly one complete event"
+        assert max(token_indices) < min(complete_indices)
 
     def test_same_response_used_for_validation(self, client_with_stream):
         """Requirement: the same streamed response is used for final validation."""

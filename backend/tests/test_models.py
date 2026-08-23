@@ -25,16 +25,21 @@ from app.models.note import NoteCreate
 from app.models.user import AuthenticatedUser
 
 
-def _valid_condition_from_model(**overrides: object) -> ConditionFromModel:
-    payload = {
-        "condition_name": "Type 2 diabetes mellitus",
-        "evidence_quote": "Type 2 diabetes, controlled",
-        "documentation_status": DocumentationStatus.WELL_DOCUMENTED,
-        "suggested_icd10": "E11.9",
-        "confidence": 0.8,
-    }
-    payload.update(overrides)
-    return ConditionFromModel(**payload)
+def _valid_condition_from_model(**overrides) -> ConditionFromModel:
+    return ConditionFromModel(
+        **{
+            "condition_name": "Type 2 diabetes mellitus",
+            "evidence_quote": "Type 2 diabetes, controlled",
+            "documentation_status": DocumentationStatus.WELL_DOCUMENTED,
+            "suggested_icd10": "E11.9",
+            "confidence": 0.8,
+            **overrides,
+        }
+    )
+
+
+def _make_condition_from_model(**kwargs) -> ConditionFromModel:
+    return ConditionFromModel(**kwargs)
 
 
 # ---- ConditionFromModel ----
@@ -85,6 +90,21 @@ def test_condition_from_model_rejects_invalid_documentation_status() -> None:
 def test_condition_from_model_rejects_blank_icd10(suggested_icd10: str) -> None:
     with pytest.raises(ValidationError):
         _valid_condition_from_model(suggested_icd10=suggested_icd10)
+
+
+def test_condition_from_model_rejects_none_suggested_icd10() -> None:
+    with pytest.raises(ValidationError):
+        _valid_condition_from_model(suggested_icd10=None)
+
+
+def test_condition_from_model_rejects_missing_suggested_icd10() -> None:
+    with pytest.raises(ValidationError):
+        _make_condition_from_model(
+            condition_name="Type 2 diabetes mellitus",
+            evidence_quote="Type 2 diabetes, controlled",
+            documentation_status=DocumentationStatus.WELL_DOCUMENTED,
+            confidence=0.8,
+        )
 
 
 # ---- Condition (stored / immutable) ----
@@ -175,24 +195,24 @@ def test_condition_review_accepted_requires_source_id() -> None:
 
 
 def test_review_create_rejects_duplicate_source_ids() -> None:
-    shared = {
-        "condition_name": "Diabetes",
-        "evidence_quote": "Type 2 diabetes",
-        "documentation_status": DocumentationStatus.AMBIGUOUS,
-        "suggested_icd10": "E11.9",
-    }
     with pytest.raises(ValidationError):
         ReviewCreate(
             conditions=[
                 ConditionReview(
                     source_condition_id="c1",
                     status=ConditionReviewStatus.ACCEPTED,
-                    **shared,
+                    condition_name="Diabetes",
+                    evidence_quote="Type 2 diabetes",
+                    documentation_status=DocumentationStatus.AMBIGUOUS,
+                    suggested_icd10="E11.9",
                 ),
                 ConditionReview(
                     source_condition_id="c1",
                     status=ConditionReviewStatus.EDITED,
-                    **shared,
+                    condition_name="Diabetes",
+                    evidence_quote="Type 2 diabetes",
+                    documentation_status=DocumentationStatus.AMBIGUOUS,
+                    suggested_icd10="E11.9",
                 ),
             ]
         )

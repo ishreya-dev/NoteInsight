@@ -182,6 +182,18 @@ def test_select_valid_candidate_above_threshold():
     assert select_best_similar_candidate(new, [cand]) is cand
 
 
+def test_select_candidate_at_exact_threshold_is_accepted():
+    base_text = (
+        "patient is a 64 year old male with type 2 diabetes mellitus hypertension "
+        "and hyperlipidemia managed on metformin lisinopril atorvastatin with "
+        "adequate glycemic control and stable vitals no known drug allergies "
+        "followed in clinic for routine care reports good adherence to"
+    )
+    new_text = base_text.replace("patient ", "client ", 1)
+    cand = _candidate(base_text, summary="base")
+    assert select_best_similar_candidate(new_text, [cand]) is cand
+
+
 def test_select_candidate_below_threshold():
     other = "pediatric patient with acute otitis media treated with amoxicillin"
     cand = _candidate(other, summary="other")

@@ -1,5 +1,6 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
 import FailedAnalysisNotice from "./FailedAnalysisNotice";
 import type { Analysis } from "../api/types";
 
@@ -35,5 +36,46 @@ describe("FailedAnalysisNotice", () => {
 
     expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry analysis" })).toBeInTheDocument();
+  });
+
+  it("calls onRetry when the Retry analysis button is clicked", async () => {
+    const onRetry = vi.fn();
+    render(
+      <FailedAnalysisNotice
+        analysis={analysis("timeout")}
+        onRetry={onRetry}
+        retrying={false}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry analysis" }));
+
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables the Retry button while retrying", () => {
+    render(
+      <FailedAnalysisNotice
+        analysis={analysis("timeout")}
+        onRetry={vi.fn()}
+        retrying={true}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Retrying…" })).toBeDisabled();
+  });
+
+  it("renders the failure message for a known failure reason", () => {
+    render(
+      <FailedAnalysisNotice
+        analysis={analysis("timeout")}
+        onRetry={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    expect(
+      screen.getByText("The AI service took too long to respond. Please try again."),
+    ).toBeInTheDocument();
   });
 });

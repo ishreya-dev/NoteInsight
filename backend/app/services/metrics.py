@@ -78,28 +78,30 @@ def compute_condition_correction_metrics(
                 stats.times_added += 1
                 continue
 
-            original = original_conditions_by_id.get(
-                condition_review.source_condition_id
-            )
+            source_condition_id = condition_review.source_condition_id
+            if source_condition_id is None:
+                continue
+
+            original = original_conditions_by_id.get(source_condition_id)
 
             if original is None:
                 continue
 
-            stats = corrections_by_name.setdefault(
+            correction_stats = corrections_by_name.setdefault(
                 original.condition_name,
                 ConditionCorrectionStats(
                     condition_name=original.condition_name
                 ),
             )
 
-            stats.times_extracted += 1
+            correction_stats.times_extracted += 1
 
             if condition_review.status == ConditionReviewStatus.ACCEPTED:
-                stats.times_accepted += 1
+                correction_stats.times_accepted += 1
             elif condition_review.status == ConditionReviewStatus.EDITED:
-                stats.times_edited += 1
+                correction_stats.times_edited += 1
             elif condition_review.status == ConditionReviewStatus.REJECTED:
-                stats.times_rejected += 1
+                correction_stats.times_rejected += 1
 
     return MetricsSummary(
         reviews_analyzed=reviews_analyzed,

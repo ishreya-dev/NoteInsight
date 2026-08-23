@@ -7,6 +7,7 @@ when the SSE client disconnects mid-analysis.
 from __future__ import annotations
 
 import asyncio  # noqa: E408 — used by test_timeout_failure_preserves_timeout_reason
+from typing import Awaitable, Protocol, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,7 +15,12 @@ from fastapi import Request
 
 from app.routers import notes as notes_router
 from app.services.gemini_client import GeminiAnalysisError
-from tests.conftest import TEST_USER, make_analysis, make_note
+from tests.conftest import TEST_USER, _parse_sse, make_note
+
+
+class _TestAsyncStream(Protocol):
+    def __anext__(self) -> Awaitable[str]: ...
+    async def aclose(self) -> None: ...
 
 
 def _make_request_scope(path: str = "/notes/n1/analysis/stream") -> dict:
@@ -36,6 +42,7 @@ async def test_client_disconnect_during_streaming_marks_job_interrupted(
     db: AsyncMock,
     gemini: AsyncMock,
     caplog,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Consume a token during active analysis, then close the generator.
 
@@ -56,7 +63,7 @@ async def test_client_disconnect_during_streaming_marks_job_interrupted(
         yield " presents with diabetes"
         # Generator is closed by the test here (simulates client disconnect).
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -68,7 +75,7 @@ async def test_client_disconnect_during_streaming_marks_job_interrupted(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     first_event = await iterator.__anext__()
     assert "event: status" in first_event
     assert '"stage": "preparing"' in first_event
@@ -95,6 +102,7 @@ async def test_client_disconnect_during_streaming_marks_job_interrupted(
 async def test_successful_analysis_does_not_mark_job_interrupted(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the analysis completes normally, the ``finally`` cleanup must not
     overwrite the completed job status."""
@@ -116,7 +124,7 @@ async def test_successful_analysis_does_not_mark_job_interrupted(
         for char in gemini_payload:
             yield char
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -128,7 +136,7 @@ async def test_successful_analysis_does_not_mark_job_interrupted(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -140,7 +148,6 @@ async def test_successful_analysis_does_not_mark_job_interrupted(
 
     # finish_analysis_job must have been called exactly once: by
     # _persist_and_finish with status "completed", NOT again by the finally.
-    assert db.finish_analysis_job.await_count == 1
     db.finish_analysis_job.assert_awaited_once_with(
         job_id="job-1",
         status="completed",
@@ -148,12 +155,18 @@ async def test_successful_analysis_does_not_mark_job_interrupted(
         error_message=None,
         error_reason=None,
     )
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_gemini_failure_preserves_original_reason(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When GeminiAnalysisError is raised, the existing handler controls the
     failure reason. The finally block must not overwrite with 'interrupted'."""
@@ -170,7 +183,7 @@ async def test_gemini_failure_preserves_original_reason(
         yield "SUMMARY: incomplete..."
         raise GeminiAnalysisError("bad output", failure_reason="invalid_output")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -182,7 +195,7 @@ async def test_gemini_failure_preserves_original_reason(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -190,22 +203,29 @@ async def test_gemini_failure_preserves_original_reason(
     except StopAsyncIteration:
         pass
 
-    assert any(
-        "event: error" in e and '"reason": "invalid_output"' in e for e in events
-    )
+    parsed = _parse_sse("\n\n".join(events))
+    error_events = [e for e in parsed if e["event"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["data"]["reason"] == "invalid_output"
+    assert not any(e["event"] == "complete" for e in parsed)
 
     # finish_analysis_job called once by the handler with the specific reason,
     # not a second time with 'interrupted'.
-    assert db.finish_analysis_job.await_count == 1
     call_kwargs = db.finish_analysis_job.await_args.kwargs
     assert call_kwargs["status"] == "failed"
     assert call_kwargs["error_reason"] == "invalid_output"
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_timeout_failure_preserves_timeout_reason(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the deadline is exceeded, the failure reason must remain 'timeout'
     and no duplicate 'interrupted' update should occur."""
@@ -223,7 +243,7 @@ async def test_timeout_failure_preserves_timeout_reason(
         # Exceed the deadline immediately on the next consumer check.
         raise asyncio.TimeoutError()
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -235,7 +255,7 @@ async def test_timeout_failure_preserves_timeout_reason(
         settings=_make_settings(timeout=60),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -245,7 +265,6 @@ async def test_timeout_failure_preserves_timeout_reason(
 
     assert any("event: error" in e and '"reason": "timeout"' in e for e in events)
 
-    assert db.finish_analysis_job.await_count == 1
     db.finish_analysis_job.assert_awaited_once_with(
         job_id="job-1",
         status="failed",
@@ -253,12 +272,18 @@ async def test_timeout_failure_preserves_timeout_reason(
         error_message="Analysis failed. Please try again.",
         error_reason="timeout",
     )
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_gemini_analysis_error_persistence_failure_still_emits_error(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If _persist_and_finish fails after a GeminiAnalysisError, the SSE error
     event must still be emitted and the job must not be marked interrupted."""
@@ -275,7 +300,7 @@ async def test_gemini_analysis_error_persistence_failure_still_emits_error(
         yield "SUMMARY: incomplete..."
         raise GeminiAnalysisError("bad output", failure_reason="invalid_output")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
     db.finish_analysis_job.side_effect = RuntimeError("firestore unavailable")
 
@@ -288,7 +313,7 @@ async def test_gemini_analysis_error_persistence_failure_still_emits_error(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -300,16 +325,21 @@ async def test_gemini_analysis_error_persistence_failure_still_emits_error(
         "event: error" in e and '"reason": "invalid_output"' in e for e in events
     )
 
-    assert db.finish_analysis_job.await_count == 1
     call_kwargs = db.finish_analysis_job.await_args.kwargs
     assert call_kwargs["status"] == "failed"
     assert call_kwargs["error_reason"] == "invalid_output"
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_timeout_error_persistence_failure_still_emits_error(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If _persist_and_finish fails after a TimeoutError, the SSE error event
     must still be emitted and the job must not be marked interrupted."""
@@ -326,7 +356,7 @@ async def test_timeout_error_persistence_failure_still_emits_error(
         yield "SUMMARY: starting..."
         raise asyncio.TimeoutError()
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
     db.finish_analysis_job.side_effect = RuntimeError("firestore unavailable")
 
@@ -339,7 +369,7 @@ async def test_timeout_error_persistence_failure_still_emits_error(
         settings=_make_settings(timeout=60),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -349,16 +379,21 @@ async def test_timeout_error_persistence_failure_still_emits_error(
 
     assert any("event: error" in e and '"reason": "timeout"' in e for e in events)
 
-    assert db.finish_analysis_job.await_count == 1
     call_kwargs = db.finish_analysis_job.await_args.kwargs
     assert call_kwargs["status"] == "failed"
     assert call_kwargs["error_reason"] == "timeout"
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_generic_exception_persistence_failure_still_emits_error(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If _persist_and_finish fails after a generic Exception, the SSE error
     event must still be emitted and the job must not be marked interrupted."""
@@ -375,7 +410,7 @@ async def test_generic_exception_persistence_failure_still_emits_error(
         yield "SUMMARY: starting..."
         raise RuntimeError("unexpected provider failure")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
     db.finish_analysis_job.side_effect = RuntimeError("firestore unavailable")
 
@@ -388,7 +423,7 @@ async def test_generic_exception_persistence_failure_still_emits_error(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -396,20 +431,27 @@ async def test_generic_exception_persistence_failure_still_emits_error(
     except StopAsyncIteration:
         pass
 
-    assert any(
-        "event: error" in e and '"reason": "unknown"' in e for e in events
-    )
+    parsed = _parse_sse("\n\n".join(events))
+    error_events = [e for e in parsed if e["event"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["data"]["reason"] == "unknown"
+    assert not any(e["event"] == "complete" for e in parsed)
 
-    assert db.finish_analysis_job.await_count == 1
     call_kwargs = db.finish_analysis_job.await_args.kwargs
     assert call_kwargs["status"] == "failed"
     assert call_kwargs["error_reason"] == "unknown"
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_gemini_failure_with_persist_failure_marks_job_failed(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the failed-analysis persist itself fails (not the finish step), the
     job must still reach a terminal ``failed`` state with the original reason,
@@ -428,7 +470,7 @@ async def test_gemini_failure_with_persist_failure_marks_job_failed(
         yield "SUMMARY: incomplete..."
         raise GeminiAnalysisError("bad output", failure_reason="invalid_output")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -440,7 +482,7 @@ async def test_gemini_failure_with_persist_failure_marks_job_failed(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -452,16 +494,21 @@ async def test_gemini_failure_with_persist_failure_marks_job_failed(
         "event: error" in e and '"reason": "invalid_output"' in e for e in events
     )
     # Fallback finish must run exactly once with the original reason.
-    assert db.finish_analysis_job.await_count == 1
     call_kwargs = db.finish_analysis_job.await_args.kwargs
     assert call_kwargs["status"] == "failed"
     assert call_kwargs["error_reason"] == "invalid_output"
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_timeout_failure_with_persist_failure_marks_job_failed(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Same guarantee as the Gemini case, for the timeout failure path."""
     note = make_note(note_id="n1").model_copy(update={"analysis_job_id": "job-1"})
@@ -478,7 +525,7 @@ async def test_timeout_failure_with_persist_failure_marks_job_failed(
         yield "SUMMARY: starting..."
         raise asyncio.TimeoutError()
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -490,25 +537,34 @@ async def test_timeout_failure_with_persist_failure_marks_job_failed(
         settings=_make_settings(timeout=60),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
             events.append(await iterator.__anext__())
     except StopAsyncIteration:
         pass
+    parsed = _parse_sse("\n\n".join(events))
+    error_events = [e for e in parsed if e["event"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["data"]["reason"] == "timeout"
+    assert not any(e["event"] == "complete" for e in parsed)
 
-    assert any("event: error" in e and '"reason": "timeout"' in e for e in events)
-    assert db.finish_analysis_job.await_count == 1
     call_kwargs = db.finish_analysis_job.await_args.kwargs
     assert call_kwargs["status"] == "failed"
     assert call_kwargs["error_reason"] == "timeout"
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
 async def test_generic_failure_with_persist_failure_marks_job_failed(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Same guarantee as the Gemini case, for the generic exception path."""
     note = make_note(note_id="n1").model_copy(update={"analysis_job_id": "job-1"})
@@ -525,7 +581,7 @@ async def test_generic_failure_with_persist_failure_marks_job_failed(
         yield "SUMMARY: starting..."
         raise RuntimeError("unexpected provider failure")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -537,7 +593,7 @@ async def test_generic_failure_with_persist_failure_marks_job_failed(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -546,10 +602,14 @@ async def test_generic_failure_with_persist_failure_marks_job_failed(
         pass
 
     assert any("event: error" in e and '"reason": "unknown"' in e for e in events)
-    assert db.finish_analysis_job.await_count == 1
     call_kwargs = db.finish_analysis_job.await_args.kwargs
     assert call_kwargs["status"] == "failed"
     assert call_kwargs["error_reason"] == "unknown"
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
@@ -557,6 +617,7 @@ async def test_cleanup_failure_is_swallowed(
     db: AsyncMock,
     gemini: AsyncMock,
     caplog,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If the interrupt-cleanup ``finish_analysis_job`` call itself fails, the
     generator must not raise — the original ``GeneratorExit`` must propagate
@@ -577,7 +638,7 @@ async def test_cleanup_failure_is_swallowed(
     def failing_finish(*_a, **_kw):
         raise RuntimeError("firestore unavailable during cleanup")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
     db.finish_analysis_job.side_effect = failing_finish
 
@@ -590,7 +651,7 @@ async def test_cleanup_failure_is_swallowed(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     await iterator.__anext__()  # status
     await iterator.__anext__()  # token
     await iterator.aclose()
@@ -605,6 +666,7 @@ async def test_cleanup_failure_is_swallowed(
 async def test_disconnect_after_successful_persist_does_not_overwrite(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If the generator is closed AFTER ``_persist_and_finish`` succeeds, the
     job must remain ``completed`` — not be flipped to ``interrupted``.
@@ -631,7 +693,7 @@ async def test_disconnect_after_successful_persist_does_not_overwrite(
         for char in gemini_payload:
             yield char
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -643,7 +705,7 @@ async def test_disconnect_after_successful_persist_does_not_overwrite(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     try:
         while True:
             event = await iterator.__anext__()
@@ -657,7 +719,6 @@ async def test_disconnect_after_successful_persist_does_not_overwrite(
 
     # finish_analysis_job was called once by _persist_and_finish with status
     # "completed". The finally block must NOT run because job_completed is True.
-    assert db.finish_analysis_job.await_count == 1
     db.finish_analysis_job.assert_awaited_once_with(
         job_id="job-1",
         status="completed",
@@ -665,6 +726,11 @@ async def test_disconnect_after_successful_persist_does_not_overwrite(
         error_message=None,
         error_reason=None,
     )
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 @pytest.mark.asyncio
@@ -698,7 +764,7 @@ async def test_disconnect_during_exact_cache_hit_does_not_overwrite(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     try:
         while True:
             event = await iterator.__anext__()
@@ -709,7 +775,6 @@ async def test_disconnect_during_exact_cache_hit_does_not_overwrite(
         pass
 
     # finish_analysis_job called exactly once by _persist_and_finish.
-    assert db.finish_analysis_job.await_count == 1
     db.finish_analysis_job.assert_awaited_once_with(
         job_id="job-1",
         status="completed",
@@ -717,6 +782,11 @@ async def test_disconnect_during_exact_cache_hit_does_not_overwrite(
         error_message=None,
         error_reason=None,
     )
+    interrupted_calls = [
+        c for c in db.finish_analysis_job.await_args_list
+        if c.kwargs.get("error_reason") == "interrupted"
+    ]
+    assert interrupted_calls == []
 
 
 def _make_gemini_streaming_payload() -> str:
@@ -756,7 +826,7 @@ async def _run_stream_to_completion(
         settings=settings,
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -919,6 +989,7 @@ async def test_both_finish_attempts_fail_retry_succeeds_job_completed(
 async def test_both_finish_attempts_fail_marks_job_failed_and_preserves_analysis(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When finish_analysis_job fails for all completed attempts, the successful
     Analysis must be preserved, note.latest_analysis_id must remain unchanged,
@@ -942,7 +1013,7 @@ async def test_both_finish_attempts_fail_marks_job_failed_and_preserves_analysis
         yield "SUMMARY: Follow-up.\n"
         yield 'DATA:{"conditions": [], "gaps": [], "summary": "Follow-up."}'
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     response = await notes_router.stream_analysis(
@@ -954,7 +1025,7 @@ async def test_both_finish_attempts_fail_marks_job_failed_and_preserves_analysis
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -983,6 +1054,7 @@ async def test_both_finish_attempts_fail_marks_job_failed_and_preserves_analysis
 async def test_reanalysis_failure_preserves_previous_latest_analysis_id(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When a re-analysis fails, the note's previous successful Analysis ID
     must be preserved as ``latest_analysis_id``."""
@@ -1003,7 +1075,7 @@ async def test_reanalysis_failure_preserves_previous_latest_analysis_id(
         yield "SUMMARY: starting..."
         raise RuntimeError("unexpected provider failure")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     async def persist_and_update(analysis, *, condition_count: int, latest_analysis_id=None):
@@ -1020,7 +1092,7 @@ async def test_reanalysis_failure_preserves_previous_latest_analysis_id(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:
@@ -1044,6 +1116,7 @@ async def test_reanalysis_failure_preserves_previous_latest_analysis_id(
 async def test_new_note_failure_sets_latest_analysis_id_to_failed(
     db: AsyncMock,
     gemini: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When a new note (no previous Analysis) fails, the failed Analysis ID
     becomes ``latest_analysis_id``."""
@@ -1063,7 +1136,7 @@ async def test_new_note_failure_sets_latest_analysis_id_to_failed(
         yield "SUMMARY: starting..."
         raise RuntimeError("unexpected provider failure")
 
-    notes_router.find_similar_cached_analysis = fake_similar
+    monkeypatch.setattr(notes_router, 'find_similar_cached_analysis', fake_similar)
     gemini.stream_analyze_note = streaming_chunks
 
     async def persist_and_update(analysis, *, condition_count: int, latest_analysis_id=None):
@@ -1080,7 +1153,7 @@ async def test_new_note_failure_sets_latest_analysis_id_to_failed(
         settings=_make_settings(),
     )
 
-    iterator = response.body_iterator
+    iterator = cast(_TestAsyncStream, response.body_iterator)
     events: list[str] = []
     try:
         while True:

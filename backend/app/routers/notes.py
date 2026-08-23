@@ -19,7 +19,6 @@ from app.dependencies import enforce_analysis_rate_limit, get_current_user
 from app.models.analysis import Analysis, AnalysisJobStatus, Review
 from app.models.note import Note, NoteCreate, NoteListItem
 from app.models.user import AuthenticatedUser
-from app.services.analysis_jobs import _run_analysis_job
 from app.services.firestore_client import (
     DocumentConflictError,
     DocumentDataError,
@@ -259,6 +258,7 @@ async def stream_analysis(
     async def events() -> AsyncIterator[str]:
         stream_started_at = time.perf_counter()
         poll_count = 0
+        analysis: Analysis | None = None
 
         def log_stream_completed() -> None:
             logger.info(

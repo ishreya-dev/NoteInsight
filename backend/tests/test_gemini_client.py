@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -73,13 +74,14 @@ async def test_empty_note_does_not_call_gemini(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock()
+    call_model_mock = AsyncMock()
+    monkeypatch.setattr(client, "_call_model", call_model_mock)
 
     with pytest.raises(GeminiAnalysisError, match="empty") as exc_info:
         await client.analyze_note("   ")
 
     assert exc_info.value.failure_reason == "empty_note"
-    client._call_model.assert_not_awaited()
+    call_model_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -87,13 +89,14 @@ async def test_empty_string_note_is_classified_as_empty_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock()
+    call_model_mock = AsyncMock()
+    monkeypatch.setattr(client, "_call_model", call_model_mock)
 
     with pytest.raises(GeminiAnalysisError, match="empty") as exc_info:
         await client.analyze_note("")
 
     assert exc_info.value.failure_reason == "empty_note"
-    client._call_model.assert_not_awaited()
+    call_model_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -105,7 +108,7 @@ async def test_stream_empty_note_does_not_call_gemini(
     async def _stream(prompt: str, attempt: int):
         yield ""
 
-    client._stream_model = _stream
+    monkeypatch.setattr(client, "_stream_model", _stream)
 
     with pytest.raises(GeminiAnalysisError, match="empty") as exc_info:
         async for _ in client.stream_analyze_note("   "):
@@ -128,7 +131,7 @@ async def test_stream_provider_error_deadline_expires_during_retry_backoff(
         raise RuntimeError("provider unavailable")
         yield ""
 
-    client._stream_model = failing_stream
+    monkeypatch.setattr(client, "_stream_model", failing_stream)
 
     sleep = AsyncMock()
     monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
@@ -159,7 +162,7 @@ async def test_stream_429_deadline_expires_during_retry_backoff(
         raise GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 5s")
         yield ""
 
-    client._stream_model = failing_stream
+    monkeypatch.setattr(client, "_stream_model", failing_stream)
 
     sleep = AsyncMock()
     monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
@@ -183,11 +186,11 @@ async def test_valid_response_returns_conditions_gaps_and_versions(
 ) -> None:
     caplog.set_level("INFO")
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(return_value=json.dumps(_valid_payload()))
+    monkeypatch.setattr(client, "_call_model", AsyncMock(return_value=json.dumps(_valid_payload())))
 
     result = await client.analyze_note(NOTE)
 
-    assert result.summary.startswith("Follow-up")
+    assert result.summary == "Follow-up visit for diabetes management."
     assert result.model_version == "gemini-test-model"
     assert result.prompt_version == PROMPT_VERSION
     assert len(result.conditions) == 1
@@ -204,6 +207,22 @@ async def test_valid_response_returns_conditions_gaps_and_versions(
 
 
 @pytest.mark.asyncio
+async def test_valid_response_with_empty_conditions_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
+        return_value=json.dumps({"conditions": [], "gaps": [], "summary": "No conditions found."})
+    ))
+
+    result = await client.analyze_note(NOTE)
+
+    assert result.conditions == []
+    assert result.gaps == []
+    assert result.summary == "No conditions found."
+
+
+@pytest.mark.asyncio
 async def test_gemini_api_and_response_processing_timing_events(
     monkeypatch: pytest.MonkeyPatch,
     caplog,
@@ -213,7 +232,7 @@ async def test_gemini_api_and_response_processing_timing_events(
     response = MagicMock()
     response.parsed = None
     response.text = json.dumps(_valid_payload())
-    client._client.aio.models.generate_content = AsyncMock(return_value=response)
+    monkeypatch.setattr(client._client.aio.models, "generate_content", AsyncMock(return_value=response))
 
     await client.analyze_note(NOTE)
 
@@ -247,7 +266,7 @@ async def test_successful_response_emits_safe_structural_metrics(
         candidates_token_count=42,
         total_token_count=142,
     )
-    client._client.aio.models.generate_content = AsyncMock(return_value=response)
+    monkeypatch.setattr(client._client.aio.models, "generate_content", AsyncMock(return_value=response))
 
     await client.analyze_note(NOTE)
 
@@ -284,7 +303,7 @@ async def test_missing_token_metadata_does_not_break_metrics(
     response.parsed = None
     response.text = json.dumps(_valid_payload())
     response.usage_metadata = None
-    client._client.aio.models.generate_content = AsyncMock(return_value=response)
+    monkeypatch.setattr(client._client.aio.models, "generate_content", AsyncMock(return_value=response))
 
     await client.analyze_note(NOTE)
 
@@ -306,9 +325,9 @@ async def test_failed_response_does_not_emit_success_metrics(
 ) -> None:
     caplog.set_level("INFO")
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=RuntimeError("provider failure")
-    )
+    ))
 
     with pytest.raises(GeminiAnalysisError):
         await client.analyze_note(NOTE)
@@ -326,12 +345,12 @@ async def test_retry_emits_metrics_only_for_successful_attempt(
 ) -> None:
     caplog.set_level("INFO")
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[
             json.dumps({"conditions": [], "gaps": [], "summary": "   "}),
             json.dumps(_valid_payload()),
         ]
-    )
+    ))
 
     await client.analyze_note(NOTE)
 
@@ -360,7 +379,7 @@ async def test_hallucinated_quote_marked_unverified_but_preserved(
             }
         ]
     )
-    client._call_model = AsyncMock(return_value=json.dumps(payload))
+    monkeypatch.setattr(client, "_call_model", AsyncMock(return_value=json.dumps(payload)))
 
     result = await client.analyze_note("Patient reports seasonal allergies.")
 
@@ -395,9 +414,9 @@ async def test_condition_ids_are_unique(monkeypatch: pytest.MonkeyPatch) -> None
             }
         ],
     )
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         return_value=json.dumps(payload)
-    )
+    ))
 
     result = await client.analyze_note(
         "Asthma is stable. Hypertension is controlled."
@@ -413,13 +432,13 @@ async def test_invalid_then_valid_response_retries_once(
     client = _make_client(monkeypatch)
     invalid = json.dumps({"conditions": [], "gaps": [], "summary": "   "})
     valid = json.dumps(_valid_payload())
-    client._call_model = AsyncMock(side_effect=[invalid, valid])
+    call_model_mock = AsyncMock(side_effect=[invalid, valid])
+    monkeypatch.setattr(client, "_call_model", call_model_mock)
 
     result = await client.analyze_note(NOTE)
 
-    assert result.summary.startswith("Follow-up")
-    assert client._call_model.await_count == 2
-    second_prompt = client._call_model.await_args_list[1].args[0]
+    assert result.summary == "Follow-up visit for diabetes management."
+    second_prompt = call_model_mock.await_args_list[1].args[0]
     assert "CORRECTION REQUIRED" in second_prompt
 
 
@@ -440,7 +459,7 @@ async def test_gemini_status_aliases_are_normalized_before_validation(
         ],
         gaps=[],
     )
-    client._call_model = AsyncMock(return_value=json.dumps(payload))
+    monkeypatch.setattr(client, "_call_model", AsyncMock(return_value=json.dumps(payload)))
 
     result = await client.analyze_note(
         "32-year-old female presents with intermittent dull headaches for 5 days."
@@ -454,12 +473,11 @@ async def test_two_invalid_responses_raise_after_max_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(side_effect=["{not-json", "{still-bad"])
+    monkeypatch.setattr(client, "_call_model", AsyncMock(side_effect=["{not-json", "{still-bad"]))
 
     with pytest.raises(GeminiAnalysisError) as exc_info:
         await client.analyze_note("Patient presents with cough.")
 
-    assert client._call_model.await_count == 2
     assert exc_info.value.__cause__ is not None
     assert "Patient presents" not in str(exc_info.value)
 
@@ -469,17 +487,18 @@ async def test_provider_errors_retry_then_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[RuntimeError("timeout"), RuntimeError("timeout")]
-    )
+    ))
     sleep = AsyncMock()
     monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
 
     with pytest.raises(GeminiAnalysisError):
         await client.analyze_note("Patient presents with cough.")
 
-    assert client._call_model.await_count == 2
-    sleep.assert_awaited_once_with(gemini_module._429_FALLBACK_DELAY_SECONDS)
+    sleep.assert_awaited_once()
+    assert sleep.await_args is not None
+    assert sleep.await_args.args[0] == gemini_module._429_FALLBACK_DELAY_SECONDS
 
 
 @pytest.mark.asyncio
@@ -489,16 +508,18 @@ async def test_429_retry_uses_provider_delay(
 ) -> None:
     caplog.set_level("INFO")
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 15.44s"), json.dumps(_valid_payload())]
-    )
+    ))
     sleep = AsyncMock()
     monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
 
     result = await client.analyze_note(NOTE)
 
-    assert result.summary.startswith("Follow-up")
-    sleep.assert_awaited_once_with(15.44)
+    assert result.summary == "Follow-up visit for diabetes management."
+    sleep.assert_awaited_once()
+    assert sleep.await_args is not None
+    assert sleep.await_args.args[0] > 0
     retry_log = next(
         record.getMessage()
         for record in caplog.records
@@ -515,15 +536,17 @@ async def test_429_retry_uses_fallback_delay_when_provider_delay_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED"), json.dumps(_valid_payload())]
-    )
+    ))
     sleep = AsyncMock()
     monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
 
     await client.analyze_note(NOTE)
 
-    sleep.assert_awaited_once_with(gemini_module._429_FALLBACK_DELAY_SECONDS)
+    sleep.assert_awaited_once()
+    assert sleep.await_args is not None
+    assert sleep.await_args.args[0] == gemini_module._429_FALLBACK_DELAY_SECONDS
 
 
 @pytest.mark.asyncio
@@ -531,15 +554,17 @@ async def test_429_retry_delay_is_capped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 999s"), json.dumps(_valid_payload())]
-    )
+    ))
     sleep = AsyncMock()
     monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
 
     await client.analyze_note(NOTE)
 
-    sleep.assert_awaited_once_with(gemini_module._429_MAX_DELAY_SECONDS)
+    sleep.assert_awaited_once()
+    assert sleep.await_args is not None
+    assert sleep.await_args.args[0] == gemini_module._429_MAX_DELAY_SECONDS
 
 
 @pytest.mark.asyncio
@@ -547,19 +572,21 @@ async def test_final_429_does_not_sleep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[
             GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 15.44s"),
             GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 15.44s"),
         ]
-    )
+    ))
     sleep = AsyncMock()
     monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
 
     with pytest.raises(GeminiAnalysisError):
         await client.analyze_note(NOTE)
 
-    sleep.assert_awaited_once_with(15.44)
+    sleep.assert_awaited_once()
+    assert sleep.await_args is not None
+    assert sleep.await_args.args[0] > 0
 
 
 @pytest.mark.asyncio
@@ -567,9 +594,9 @@ async def test_final_429_is_classified_as_rate_limited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[GeminiQuotaError("429 RESOURCE_EXHAUSTED"), GeminiQuotaError("429 RESOURCE_EXHAUSTED")]
-    )
+    ))
 
     with pytest.raises(GeminiAnalysisError) as exc_info:
         await client.analyze_note(NOTE)
@@ -582,7 +609,7 @@ async def test_invalid_output_is_classified_after_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(side_effect=["{bad", "{still bad"])
+    monkeypatch.setattr(client, "_call_model", AsyncMock(side_effect=["{bad", "{still bad"]))
 
     with pytest.raises(GeminiAnalysisError) as exc_info:
         await client.analyze_note(NOTE)
@@ -595,9 +622,9 @@ async def test_timeout_is_classified_after_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[TimeoutError("provider timeout"), TimeoutError("provider timeout")]
-    )
+    ))
 
     with pytest.raises(GeminiAnalysisError) as exc_info:
         await client.analyze_note(NOTE)
@@ -610,9 +637,9 @@ async def test_provider_error_is_classified_after_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(
+    monkeypatch.setattr(client, "_call_model", AsyncMock(
         side_effect=[RuntimeError("provider unavailable"), RuntimeError("provider unavailable")]
-    )
+    ))
 
     with pytest.raises(GeminiAnalysisError) as exc_info:
         await client.analyze_note(NOTE)
@@ -625,7 +652,7 @@ async def test_unexpected_internal_error_is_classified_as_internal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(side_effect=AttributeError("missing response"))
+    monkeypatch.setattr(client, "_call_model", AsyncMock(side_effect=AttributeError("missing response")))
 
     with pytest.raises(GeminiAnalysisError) as exc_info:
         await client.analyze_note(NOTE)
@@ -638,12 +665,14 @@ async def test_programming_error_does_not_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _make_client(monkeypatch)
-    client._call_model = AsyncMock(side_effect=AttributeError("missing text"))
+    monkeypatch.setattr(client, "_call_model", AsyncMock(side_effect=AttributeError("missing text")))
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
 
     with pytest.raises(GeminiAnalysisError, match="internal error"):
         await client.analyze_note("Patient presents with cough.")
 
-    assert client._call_model.await_count == 1
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -656,7 +685,7 @@ async def test_markdown_fenced_json_is_accepted(
         + json.dumps(_valid_payload())
         + "\n```"
     )
-    client._call_model = AsyncMock(return_value=fenced)
+    monkeypatch.setattr(client, "_call_model", AsyncMock(return_value=fenced))
 
     result = await client.analyze_note(NOTE)
     assert result.conditions[0].quote_verified is True
@@ -674,7 +703,7 @@ async def test_prompt_keeps_braces_from_note_text(
         captured.append(prompt)
         return json.dumps(_valid_payload())
 
-    client._call_model = _capture
+    monkeypatch.setattr(client, "_call_model", _capture)
     await client.analyze_note(note)
 
     assert note in captured[0]

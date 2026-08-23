@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -359,7 +360,7 @@ async def test_cache_analysis_result_without_similarity_metadata_is_unchanged() 
 
 @pytest.mark.asyncio
 async def test_cache_analysis_result_stores_expires_at() -> None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     client, doc_ref = _firestore_client_with_doc_ref()
     await client.cache_analysis_result("hash1", {"summary": "x"})
@@ -447,7 +448,7 @@ async def test_get_cached_analysis_result_ignores_similarity_metadata() -> None:
     client = _firestore_client_with_snapshot(snapshot)
     result = await client.get_cached_analysis_result("hash1")
     assert result == {"summary": "x", "buckets": ["lsh:0:aa"], "signature": [1, 2, 3]}
-    client._db.collection.assert_called_once_with("analysis_cache")
+    cast(MagicMock, client._db.collection).assert_called_once_with("analysis_cache")
 
 
 def _query_mock(returned_snapshots: list[MagicMock]) -> MagicMock:

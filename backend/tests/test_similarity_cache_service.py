@@ -1,5 +1,4 @@
 """Focused tests for the similarity-cache service-layer orchestration."""
-import logging
 
 import pytest
 
