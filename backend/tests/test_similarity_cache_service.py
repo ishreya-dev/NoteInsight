@@ -1,5 +1,5 @@
 """Focused tests for the similarity-cache service-layer orchestration."""
-import asyncio
+import logging
 
 import pytest
 
@@ -72,3 +72,19 @@ async def test_candidates_found_but_none_safe_returns_none():
     result = await find_similar_cached_analysis(db, note_text)
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_firestore_exception_returns_none_and_is_logged(caplog):
+    class _FailingDB:
+        async def find_similar_cached_results(self, buckets, limit=10):
+            raise RuntimeError("firestore unavailable")
+
+    caplog.set_level("WARNING")
+    result = await find_similar_cached_analysis(_FailingDB(), BASE)
+
+    assert result is None
+    assert any(
+        "Failed to read similar analysis cache" in record.getMessage()
+        for record in caplog.records
+    )

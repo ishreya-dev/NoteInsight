@@ -174,6 +174,7 @@ def test_initial_job_lookup_failure_emits_safe_sse_error(
     assert response.status_code == 200
     assert "event: error" in response.text
     assert "Analysis status could not be loaded." in response.text
+    assert '"reason": "unknown"' in response.text
     assert "firestore credentials leaked" not in response.text
 
 
@@ -191,7 +192,25 @@ def test_job_claim_failure_emits_safe_sse_error(
     assert response.status_code == 200
     assert "event: error" in response.text
     assert "Analysis could not be started." in response.text
+    assert '"reason": "unknown"' in response.text
     assert "firestore unavailable" not in response.text
+
+
+def test_missing_job_emits_safe_sse_error(
+    client: TestClient,
+    db: AsyncMock,
+) -> None:
+    """When the analysis job does not exist, the client receives a safe error."""
+    note = make_note(note_id="n1").model_copy(update={"analysis_job_id": "job-1"})
+    db.get_note.return_value = note
+    db.get_analysis_job.return_value = None
+
+    response = client.get(f"/notes/{note.id}/analysis/stream")
+
+    assert response.status_code == 200
+    assert "event: error" in response.text
+    assert "Analysis could not be found." in response.text
+    assert '"reason": "unknown"' in response.text
 
 
 def test_job_polling_failure_emits_safe_sse_error(
@@ -211,6 +230,7 @@ def test_job_polling_failure_emits_safe_sse_error(
     assert response.status_code == 200
     assert "event: error" in response.text
     assert "Analysis status could not be loaded." in response.text
+    assert '"reason": "unknown"' in response.text
     assert "firestore unavailable" not in response.text
 
 
@@ -232,6 +252,7 @@ def test_completed_analysis_read_failure_emits_safe_sse_error(
     assert response.status_code == 200
     assert "event: error" in response.text
     assert "Analysis could not be loaded." in response.text
+    assert '"reason": "unknown"' in response.text
     assert "private firestore detail" not in response.text
 
 
@@ -253,6 +274,7 @@ def test_completed_job_with_missing_analysis_emits_sse_error(
     assert response.status_code == 200
     assert "event: error" in response.text
     assert "Analysis could not be loaded." in response.text
+    assert '"reason": "unknown"' in response.text
 
 
 def test_failed_job_stream_includes_safe_failure_reason(

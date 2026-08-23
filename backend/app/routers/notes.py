@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from google.api_core.exceptions import FailedPrecondition
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings, get_settings
 from app.dependencies import enforce_analysis_rate_limit, get_current_user
@@ -103,9 +103,11 @@ async def create_note(
             job_id=job_id, note_id=note.id, user_id=note.user_id
         )
     except (PermissionError, LookupError) as exc:
+        await _cleanup_orphaned_note(db, note)
         raise HTTPException(status_code=404, detail="Note not found") from exc
     except Exception as exc:
         logger.exception("Unexpected failure creating analysis job")
+        await _cleanup_orphaned_note(db, note)
         raise HTTPException(
             status_code=500, detail="Note could not be created"
         ) from exc
@@ -277,12 +279,12 @@ async def stream_analysis(
             logger.exception("Failed to load analysis job %s", job_id)
             yield _sse(
                 "error",
-                {"message": "Analysis status could not be loaded."},
+                {"reason": "unknown", "message": "Analysis status could not be loaded."},
             )
             log_stream_completed()
             return
         if job is None:
-            yield _sse("error", {"message": "Analysis could not be found."})
+            yield _sse("error", {"reason": "unknown", "message": "Analysis could not be found."})
             log_stream_completed()
             return
 
@@ -296,152 +298,297 @@ async def stream_analysis(
                 logger.exception("Failed to claim analysis job %s", job_id)
                 yield _sse(
                     "error",
-                    {"message": "Analysis could not be started."},
+                    {"reason": "unknown", "message": "Analysis could not be started."},
                 )
                 log_stream_completed()
                 return
             if claimed == "claimed":
-                deadline_at = time.perf_counter() + settings.analysis_timeout_seconds
+                job_completed = False
+                try:
+                    deadline_at = time.perf_counter() + settings.analysis_timeout_seconds
 
-                cache_key = "{}:{}:{}".format(
-                    hash_note_text(note.raw_text),
-                    PROMPT_VERSION,
-                    settings.gemini_model,
-                )
-                cached_result = await _get_cached_result(db, cache_key, note.raw_text)
-                if cached_result is not None:
-                    analysis = Analysis(
-                        id=str(uuid.uuid4()),
-                        note_id=note.id,
-                        user_id=note.user_id,
-                        conditions=tuple(cached_result.conditions),
-                        gaps=tuple(cached_result.gaps),
-                        summary=cached_result.summary,
-                        model_version=cached_result.model_version,
-                        prompt_version=cached_result.prompt_version,
-                        is_failed=False,
-                        failure_reason=None,
+                    cache_key = "{}:{}:{}".format(
+                        hash_note_text(note.raw_text),
+                        PROMPT_VERSION,
+                        settings.gemini_model,
                     )
-                    await _persist_and_finish(db, note, job_id, analysis)
-                    yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
-                    yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
-                    log_stream_completed()
-                    return
-
-                similar_result = await find_similar_cached_analysis(db, note.raw_text)
-                if similar_result is not None:
-                    try:
-                        parsed_similar = _parse_cached_result(similar_result, note.raw_text)
-                    except (KeyError, TypeError, ValueError):
-                        parsed_similar = None
-                    if parsed_similar is not None:
+                    cached_result = await _get_cached_result(db, cache_key, note.raw_text)
+                    if cached_result is not None:
                         analysis = Analysis(
                             id=str(uuid.uuid4()),
                             note_id=note.id,
                             user_id=note.user_id,
-                            conditions=tuple(parsed_similar.conditions),
-                            gaps=tuple(parsed_similar.gaps),
-                            summary=parsed_similar.summary,
-                            model_version=parsed_similar.model_version,
-                            prompt_version=parsed_similar.prompt_version,
+                            conditions=tuple(cached_result.conditions),
+                            gaps=tuple(cached_result.gaps),
+                            summary=cached_result.summary,
+                            model_version=cached_result.model_version,
+                            prompt_version=cached_result.prompt_version,
                             is_failed=False,
                             failure_reason=None,
                         )
-                        await _persist_and_finish(db, note, job_id, analysis)
+                        if not await _finish_successful_analysis(
+                            db, note, job_id, analysis
+                        ):
+                            if not await _retry_finish_successful_job(
+                                db, job_id, note, analysis
+                            ):
+                                try:
+                                    await db.finish_analysis_job(
+                                        job_id=job_id,
+                                        status=AnalysisJobStatus.FAILED.value,
+                                        error_message="Analysis could not be finalized. Please try again.",
+                                        error_reason="finalization_failed",
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to mark job %s as failed after finish retries",
+                                        job_id,
+                                    )
+                                job_completed = True
+                                yield _sse(
+                                    "error",
+                                    {
+                                        "reason": "unknown",
+                                        "message": "Analysis failed. Please try again.",
+                                    },
+                                )
+                                log_stream_completed()
+                                return
+                            job_completed = True
+                            yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
+                            yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
+                            log_stream_completed()
+                            return
+                        job_completed = True
                         yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
                         yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
                         log_stream_completed()
                         return
 
-                yield _sse("status", {"stage": "preparing", "message": "Preparing clinical analysis..."})
-                try:
-                    analysis = None
-                    raw_parts: list[str] = []
-                    buffer = ""
-                    emitted_len = 0
-                    summary_start: int | None = None
-                    data_reached = False
-                    summary_marker = "SUMMARY:"
-                    data_marker = "DATA:"
-                    async for chunk in gemini.stream_analyze_note(
-                        note.raw_text,
-                        deadline_at=deadline_at,
-                    ):
+                    similar_result = await find_similar_cached_analysis(db, note.raw_text)
+                    if similar_result is not None:
+                        try:
+                            parsed_similar = _parse_cached_result(similar_result, note.raw_text)
+                        except (KeyError, TypeError, ValueError, ValidationError):
+                            parsed_similar = None
+                        if parsed_similar is not None:
+                            analysis = Analysis(
+                                id=str(uuid.uuid4()),
+                                note_id=note.id,
+                                user_id=note.user_id,
+                                conditions=tuple(parsed_similar.conditions),
+                                gaps=tuple(parsed_similar.gaps),
+                                summary=parsed_similar.summary,
+                                model_version=parsed_similar.model_version,
+                                prompt_version=parsed_similar.prompt_version,
+                                is_failed=False,
+                                failure_reason=None,
+                            )
+                            if not await _finish_successful_analysis(
+                                db, note, job_id, analysis
+                            ):
+                                if not await _retry_finish_successful_job(
+                                    db, job_id, note, analysis
+                                ):
+                                    try:
+                                        await db.finish_analysis_job(
+                                            job_id=job_id,
+                                            status=AnalysisJobStatus.FAILED.value,
+                                            error_message="Analysis could not be finalized. Please try again.",
+                                            error_reason="finalization_failed",
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "Failed to mark job %s as failed after finish retries",
+                                            job_id,
+                                        )
+                                    job_completed = True
+                                    yield _sse(
+                                        "error",
+                                        {
+                                            "reason": "unknown",
+                                            "message": "Analysis failed. Please try again.",
+                                        },
+                                    )
+                                    log_stream_completed()
+                                    return
+                                job_completed = True
+                                yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
+                                yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
+                                log_stream_completed()
+                                return
+                            job_completed = True
+                            yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
+                            yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
+                            log_stream_completed()
+                            return
+
+                    yield _sse("status", {"stage": "preparing", "message": "Preparing clinical analysis..."})
+                    try:
+                        analysis = None
+                        raw_parts: list[str] = []
+                        buffer = ""
+                        emitted_len = 0
+                        summary_start: int | None = None
+                        data_reached = False
+                        summary_marker = "SUMMARY:"
+                        data_marker = "DATA:"
+                        async for chunk in gemini.stream_analyze_note(
+                            note.raw_text,
+                            deadline_at=deadline_at,
+                        ):
+                            if time.perf_counter() > deadline_at:
+                                raise asyncio.TimeoutError()
+                            raw_parts.append(chunk)
+                            buffer += chunk
+                            if data_reached:
+                                continue
+                            if summary_start is None:
+                                found = buffer.find(summary_marker)
+                                if found != -1:
+                                    summary_start = found + len(summary_marker)
+                                    emitted_len = summary_start
+                            if summary_start is not None:
+                                data_idx = buffer.find(data_marker, summary_start)
+                                send_upto = data_idx if data_idx != -1 else len(buffer)
+                                if send_upto > emitted_len:
+                                    yield _sse("token", {"text": buffer[emitted_len:send_upto]})
+                                    emitted_len = send_upto
+                                if data_idx != -1:
+                                    data_reached = True
                         if time.perf_counter() > deadline_at:
                             raise asyncio.TimeoutError()
-                        raw_parts.append(chunk)
-                        buffer += chunk
-                        if data_reached:
-                            continue
-                        if summary_start is None:
-                            found = buffer.find(summary_marker)
-                            if found != -1:
-                                summary_start = found + len(summary_marker)
-                                emitted_len = summary_start
-                        if summary_start is not None:
-                            data_idx = buffer.find(data_marker, summary_start)
-                            send_upto = data_idx if data_idx != -1 else len(buffer)
-                            if send_upto > emitted_len:
-                                yield _sse("token", {"text": buffer[emitted_len:send_upto]})
-                                emitted_len = send_upto
-                            if data_idx != -1:
-                                data_reached = True
-                    if time.perf_counter() > deadline_at:
-                        raise asyncio.TimeoutError()
-                    analysis = await stream_analysis_and_persist(
-                        note, db, gemini, settings, raw_text="".join(raw_parts)
-                    )
-                    if time.perf_counter() > deadline_at:
-                        raise asyncio.TimeoutError()
-                    await _persist_and_finish(db, note, job_id, analysis)
-                except GeminiAnalysisError as exc:
-                    analysis = _create_failed_analysis(
-                        note=note,
-                        settings=settings,
-                        failure_reason=exc.failure_reason,
-                    )
-                    await _persist_and_finish(db, note, job_id, analysis)
-                    yield _sse("error", {
-                        "reason": exc.failure_reason,
-                        "message": "Analysis failed. Please try again.",
-                    })
-                    log_stream_completed()
-                    return
-                except asyncio.TimeoutError:
-                    await _persist_and_finish(db, note, job_id, _create_failed_analysis(
-                        note=note,
-                        settings=settings,
-                        failure_reason="timeout",
-                    ))
-                    yield _sse("error", {
-                        "reason": "timeout",
-                        "message": "Analysis took too long. Please try again.",
-                    })
-                    log_stream_completed()
-                    return
-                except Exception:
-                    logger.exception("Analysis job failed for note %s", note.id)
-                    await _persist_and_finish(db, note, job_id, _create_failed_analysis(
-                        note=note,
-                        settings=settings,
-                        failure_reason="unknown",
-                    ))
-                    yield _sse("error", {
-                        "reason": "unknown",
-                        "message": "Analysis failed. Please try again.",
-                    })
-                    log_stream_completed()
-                    return
+                        analysis = await stream_analysis_and_persist(
+                            note, db, gemini, settings, raw_text="".join(raw_parts)
+                        )
+                        if time.perf_counter() > deadline_at:
+                            raise asyncio.TimeoutError()
+                        if not await _finish_successful_analysis(
+                            db, note, job_id, analysis
+                        ):
+                            if not await _retry_finish_successful_job(
+                                db, job_id, note, analysis
+                            ):
+                                try:
+                                    await db.finish_analysis_job(
+                                        job_id=job_id,
+                                        status=AnalysisJobStatus.FAILED.value,
+                                        error_message="Analysis could not be finalized. Please try again.",
+                                        error_reason="finalization_failed",
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to mark job %s as failed after finish retries",
+                                        job_id,
+                                    )
+                                job_completed = True
+                                yield _sse(
+                                    "error",
+                                    {
+                                        "reason": "unknown",
+                                        "message": "Analysis failed. Please try again.",
+                                    },
+                                )
+                                log_stream_completed()
+                                return
+                            job_completed = True
+                        job_completed = True
+                    except GeminiAnalysisError as exc:
+                        analysis = _create_failed_analysis(
+                            note=note,
+                            settings=settings,
+                            failure_reason=exc.failure_reason,
+                        )
+                        await _ensure_terminal_failed_job(
+                            db, job_id, note, analysis, exc.failure_reason
+                        )
+                        job_completed = True
+                        yield _sse("error", {
+                            "reason": exc.failure_reason,
+                            "message": "Analysis failed. Please try again.",
+                        })
+                        log_stream_completed()
+                        return
+                    except asyncio.TimeoutError:
+                        analysis = _create_failed_analysis(
+                            note=note,
+                            settings=settings,
+                            failure_reason="timeout",
+                        )
+                        job_completed = True
+                        await _ensure_terminal_failed_job(
+                            db, job_id, note, analysis, "timeout"
+                        )
+                        yield _sse("error", {
+                            "reason": "timeout",
+                            "message": "Analysis took too long. Please try again.",
+                        })
+                        log_stream_completed()
+                        return
+                    except Exception:
+                        logger.exception("Analysis job failed for note %s", note.id)
+                        analysis = _create_failed_analysis(
+                            note=note,
+                            settings=settings,
+                            failure_reason="unknown",
+                        )
+                        await _ensure_terminal_failed_job(
+                            db, job_id, note, analysis, "unknown"
+                        )
+                        job_completed = True
+                        yield _sse("error", {
+                            "reason": "unknown",
+                            "message": "Analysis failed. Please try again.",
+                        })
+                        log_stream_completed()
+                        return
 
-                yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
-                yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
-                log_stream_completed()
-                return
+                    yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
+                    yield _sse("complete", {"note_id": note_id, "analysis": analysis.model_dump(mode="json")})
+                    log_stream_completed()
+                    return
+                finally:
+                    if not job_completed:
+                        logger.warning(
+                            "Analysis job %s interrupted (client disconnect); marking failed",
+                            job_id,
+                        )
+                        try:
+                            await db.finish_analysis_job(
+                                job_id=job_id,
+                                status=AnalysisJobStatus.FAILED.value,
+                                error_message="Analysis was interrupted. Please try again.",
+                                error_reason="interrupted",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to mark interrupted job %s as failed",
+                                job_id,
+                            )
 
         yield _sse("status", {"stage": "preparing", "message": "Preparing clinical analysis..."})
         last_status = None
+        max_polls = max(1, int(settings.analysis_timeout_seconds / 2 / 0.2))
         while True:
             if await request.is_disconnected():
+                log_stream_completed()
+                return
+            if poll_count >= max_polls:
+                logger.warning(
+                    "Polling timed out after %d polls for job %s",
+                    poll_count,
+                    job_id,
+                )
+                yield _sse(
+                    "error",
+                    {
+                        "reason": "unknown",
+                        "message": (
+                            "Analysis is taking longer than expected. "
+                            "Please refresh and try again."
+                        ),
+                    },
+                )
                 log_stream_completed()
                 return
             poll_count += 1
@@ -454,12 +601,12 @@ async def stream_analysis(
                 logger.exception("Failed to poll analysis job %s", job_id)
                 yield _sse(
                     "error",
-                    {"message": "Analysis status could not be loaded."},
+                    {"reason": "unknown", "message": "Analysis status could not be loaded."},
                 )
                 log_stream_completed()
                 return
             if job is None:
-                yield _sse("error", {"message": "Analysis could not be found."})
+                yield _sse("error", {"reason": "unknown", "message": "Analysis could not be found."})
                 log_stream_completed()
                 return
             current_status = job.get("status")
@@ -479,12 +626,12 @@ async def stream_analysis(
                     )
                     yield _sse(
                         "error",
-                        {"message": "Analysis could not be loaded."},
+                        {"reason": "unknown", "message": "Analysis could not be loaded."},
                     )
                     log_stream_completed()
                     return
                 if analysis is None:
-                    yield _sse("error", {"message": "Analysis could not be loaded."})
+                    yield _sse("error", {"reason": "unknown", "message": "Analysis could not be loaded."})
                     log_stream_completed()
                     return
                 yield _sse("status", {"stage": "finalizing", "message": "Finalizing analysis..."})
@@ -517,32 +664,150 @@ def _sse(event: str, data: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-async def _persist_and_finish(
+async def _cleanup_orphaned_note(db: FirestoreClient, note: Note) -> None:
+    """Best-effort removal of a note whose job creation failed.
+
+    Failure to delete is logged but never propagated: the original job
+    creation error is the one the client should see.
+    """
+    try:
+        await db.delete_note(note_id=note.id, user_id=note.user_id)
+    except Exception:
+        logger.exception("Failed to clean up orphaned note %s", note.id)
+
+
+async def _finish_successful_analysis(
     db: FirestoreClient,
     note: Note,
     job_id: str,
     analysis: Analysis,
-) -> None:
-    condition_count = 0 if analysis.is_failed else len(analysis.conditions)
-    await db.persist_analysis_for_note(
-        analysis,
-        condition_count=condition_count,
-    )
-    await db.finish_analysis_job(
-        job_id=job_id,
-        status=(
-            AnalysisJobStatus.FAILED.value
-            if analysis.is_failed
-            else AnalysisJobStatus.COMPLETED.value
-        ),
-        analysis_id=analysis.id,
-        error_message=(
-            "Analysis failed. Please try again."
-            if analysis.is_failed
-            else None
-        ),
-        error_reason=analysis.failure_reason if analysis.is_failed else None,
-    )
+) -> bool:
+    """Persist a *successful* ``Analysis`` and mark the job ``completed``.
+
+    If the Analysis persists but the job-finish call fails, retries finishing
+    the already-persisted Analysis (using its existing ``analysis.id``) instead
+    of letting the caller create a replacement failed Analysis. This preserves
+    ``note.latest_analysis_id`` and the successful Analysis document even when
+    the job-finish step is flaky.
+
+    Returns ``True`` if the Analysis was persisted (caller must NOT create a
+    failed Analysis), or ``False`` if persistence itself failed.
+    """
+    condition_count = len(analysis.conditions)
+    try:
+        await db.persist_analysis_for_note(
+            analysis,
+            condition_count=condition_count,
+        )
+    except Exception:
+        logger.exception("Failed to persist analysis for note %s", note.id)
+        return False
+
+    try:
+        await db.finish_analysis_job(
+            job_id=job_id,
+            status=AnalysisJobStatus.COMPLETED.value,
+            analysis_id=analysis.id,
+            error_message=None,
+            error_reason=None,
+        )
+    except Exception:
+        logger.exception(
+            "Initial finish failed for job %s; analysis %s already persisted",
+            job_id,
+            analysis.id,
+        )
+        try:
+            await db.finish_analysis_job(
+                job_id=job_id,
+                status=AnalysisJobStatus.COMPLETED.value,
+                analysis_id=analysis.id,
+            )
+        except Exception:
+            logger.exception(
+                "Retry finish also failed for job %s; analysis %s preserved",
+                job_id,
+                analysis.id,
+            )
+            return False
+    return True
+
+
+async def _retry_finish_successful_job(
+    db: FirestoreClient,
+    job_id: str,
+    note: Note,
+    analysis: Analysis,
+) -> bool:
+    try:
+        await db.finish_analysis_job(
+            job_id=job_id,
+            status=AnalysisJobStatus.COMPLETED.value,
+            analysis_id=analysis.id,
+        )
+        return True
+    except Exception:
+        logger.exception("Retry finish failed for job %s", job_id)
+        return False
+
+
+async def _ensure_terminal_failed_job(
+    db: FirestoreClient,
+    job_id: str,
+    note: Note,
+    analysis: Analysis,
+    failure_reason: str,
+) -> bool:
+    """Drive a failed job to a terminal ``failed`` state.
+
+    Persists the failed analysis first. If persisting the failed analysis
+    itself fails, falls back to marking the job failed directly so it never
+    stays ``processing``. If persistence succeeds, the job is finished as
+    failed. ``finish_analysis_job`` is invoked exactly once in either case and
+    the original ``failure_reason`` is preserved on the job. Returns ``True``
+    once the job has reached a terminal failed state.
+    """
+    preserved_latest_analysis_id = note.latest_analysis_id
+    try:
+        await db.persist_analysis_for_note(
+            analysis,
+            condition_count=0,
+            latest_analysis_id=preserved_latest_analysis_id or analysis.id,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to persist failed analysis for note %s; marking job failed",
+            note.id,
+        )
+        try:
+            await db.finish_analysis_job(
+                job_id=job_id,
+                status=AnalysisJobStatus.FAILED.value,
+                error_message="Analysis failed. Please try again.",
+                error_reason=failure_reason,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to mark job %s failed after analysis persistence error",
+                job_id,
+            )
+            return False
+    try:
+        await db.finish_analysis_job(
+            job_id=job_id,
+            status=AnalysisJobStatus.FAILED.value,
+            analysis_id=analysis.id,
+            error_message="Analysis failed. Please try again.",
+            error_reason=failure_reason,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to mark job %s failed after persisting analysis",
+            job_id,
+        )
+        return False
 
 
 def _create_failed_analysis(

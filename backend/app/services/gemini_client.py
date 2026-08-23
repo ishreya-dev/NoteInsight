@@ -483,7 +483,10 @@ class GeminiClient:
                 )
                 if attempt < _MAX_ATTEMPTS:
                     if deadline_at is not None and time.perf_counter() > deadline_at:
-                        raise asyncio.TimeoutError()
+                        raise GeminiAnalysisError(
+                            "Analysis deadline exceeded during retry",
+                            failure_reason="timeout",
+                        ) from exc
                     request_contents = build_validation_retry_prompt(
                         base_prompt,
                         exc,
@@ -516,7 +519,10 @@ class GeminiClient:
                 )
                 if attempt < _MAX_ATTEMPTS:
                     if deadline_at is not None and time.perf_counter() > deadline_at:
-                        raise asyncio.TimeoutError()
+                        raise GeminiAnalysisError(
+                            "Analysis deadline exceeded during retry",
+                            failure_reason="timeout",
+                        ) from exc
                     request_contents = base_prompt
                     if _is_resource_exhausted(exc):
                         retry_delay, delay_source = _retry_delay_from_exception(exc)
@@ -526,7 +532,10 @@ class GeminiClient:
                             else retry_delay
                         )
                         if capped_delay <= 0:
-                            raise asyncio.TimeoutError()
+                            raise GeminiAnalysisError(
+                                "Analysis deadline exceeded during retry",
+                                failure_reason="timeout",
+                            ) from exc
                         logger.info(
                             "gemini_retry_scheduled attempt=%d error_type=429 "
                             "retry_delay_ms=%d delay_source=%s",
@@ -540,7 +549,10 @@ class GeminiClient:
                         if deadline_at is not None:
                             remaining = deadline_at - time.perf_counter()
                             if fallback_delay > remaining:
-                                raise asyncio.TimeoutError()
+                                raise GeminiAnalysisError(
+                                    "Analysis deadline exceeded during retry",
+                                    failure_reason="timeout",
+                                ) from exc
                         logger.info(
                             "gemini_retry_scheduled attempt=%d error_type=%s "
                             "retry_delay_ms=%d delay_source=fallback",
@@ -550,7 +562,10 @@ class GeminiClient:
                         )
                         await asyncio.sleep(fallback_delay)
                     if deadline_at is not None and time.perf_counter() > deadline_at:
-                        raise asyncio.TimeoutError()
+                        raise GeminiAnalysisError(
+                            "Analysis deadline exceeded during retry",
+                            failure_reason="timeout",
+                        ) from exc
             finally:
                 processing_started_at = _response_processing_started_at.get()
                 if processing_started_at is not None:

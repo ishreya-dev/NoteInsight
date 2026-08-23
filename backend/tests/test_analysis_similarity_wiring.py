@@ -8,6 +8,7 @@ Gemini is skipped whenever a safe cached result (exact or similar) is found.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from app.config import get_settings
 from app.models.analysis import Condition, DocumentationStatus
@@ -192,3 +193,84 @@ async def test_cached_stored_false_but_valid_quote_is_freshly_verified():
     analysis = await _analyze_and_persist(note, db, gemini, get_settings())
 
     assert analysis.conditions[0].quote_verified is True
+
+
+@pytest.mark.asyncio
+async def test_corrupt_cached_confidence_falls_back_to_gemini():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    cached = _cached_payload()
+    cached["conditions"][0]["confidence"] = 5
+    db = _db(get_cached=cached)
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    gemini.analyze_note.assert_awaited_once()
+    db.cache_analysis_result.assert_awaited_once()
+    assert analysis.summary == "gemini summary"
+    assert not analysis.is_failed
+
+
+@pytest.mark.asyncio
+async def test_corrupt_cached_enum_falls_back_to_gemini():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    cached = _cached_payload()
+    cached["conditions"][0]["documentation_status"] = "not_a_status"
+    db = _db(get_cached=cached)
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    gemini.analyze_note.assert_awaited_once()
+    db.cache_analysis_result.assert_awaited_once()
+    assert analysis.summary == "gemini summary"
+    assert not analysis.is_failed
+
+
+@pytest.mark.asyncio
+async def test_corrupt_cached_gap_field_falls_back_to_gemini():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    cached = _cached_payload()
+    cached["gaps"] = [{"related_condition": "Type 2 diabetes mellitus"}]
+    db = _db(get_cached=cached)
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    gemini.analyze_note.assert_awaited_once()
+    db.cache_analysis_result.assert_awaited_once()
+    assert analysis.summary == "gemini summary"
+    assert not analysis.is_failed
+
+
+@pytest.mark.asyncio
+async def test_valid_exact_cache_hit_skips_gemini():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    db = _db(get_cached=_cached_payload())
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    gemini.analyze_note.assert_not_called()
+    db.cache_analysis_result.assert_not_called()
+    assert analysis.summary == "Patient has diabetes."
+
+
+@pytest.mark.asyncio
+async def test_similar_cache_lookup_failure_falls_back_to_gemini():
+    note = make_note(note_id="n1")
+    note.raw_text = BASE
+    db = _db(get_cached=None)
+    db.find_similar_cached_results.side_effect = RuntimeError("firestore unavailable")
+    gemini = _gemini()
+
+    analysis = await _analyze_and_persist(note, db, gemini, get_settings())
+
+    gemini.analyze_note.assert_awaited_once()
+    db.cache_analysis_result.assert_awaited_once()
+    assert analysis.summary == "gemini summary"
+    assert not analysis.is_failed

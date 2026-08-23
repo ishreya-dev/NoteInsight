@@ -83,6 +83,22 @@ class FirestoreClient:
             raise
         return note
 
+    async def delete_note(self, *, note_id: str, user_id: str) -> None:
+        """Delete a note if it exists and belongs to ``user_id``.
+
+        Used to clean up orphaned notes whose analysis-job creation failed.
+        Never deletes another user's note; silently returns if the note is
+        missing or ownership does not match.
+        """
+        note_ref = self._db.collection(_NOTES_COLLECTION).document(note_id)
+        snapshot = await note_ref.get()
+        if not snapshot.exists:
+            return
+        data = snapshot.to_dict() or {}
+        if data.get("user_id") != user_id:
+            return
+        await note_ref.delete()
+
     async def list_notes(
         self,
         user_id: str,
@@ -231,6 +247,7 @@ class FirestoreClient:
         analysis: Analysis,
         *,
         condition_count: int,
+        latest_analysis_id: str | None = None,
     ) -> None:
         validate_condition_count(condition_count)
         analysis_ref = self._db.collection(_ANALYSES_COLLECTION).document(
@@ -261,7 +278,7 @@ class FirestoreClient:
             transaction.update(
                 note_ref,
                 {
-                    "latest_analysis_id": analysis.id,
+                    "latest_analysis_id": latest_analysis_id if latest_analysis_id is not None else analysis.id,
                     "review_status": ReviewStatus.PENDING.value,
                     "condition_count": condition_count,
                 },

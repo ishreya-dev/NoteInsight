@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -111,6 +112,68 @@ async def test_stream_empty_note_does_not_call_gemini(
             pass
 
     assert exc_info.value.failure_reason == "empty_note"
+
+
+@pytest.mark.asyncio
+async def test_stream_provider_error_deadline_expires_during_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+
+    call_count = 0
+
+    async def failing_stream(prompt: str, attempt: int) -> AsyncIterator[str]:
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("provider unavailable")
+        yield ""
+
+    client._stream_model = failing_stream
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
+
+    deadline_at = time.perf_counter() + 0.0001
+
+    with pytest.raises(GeminiAnalysisError) as exc_info:
+        async for _ in client.stream_analyze_note("note", deadline_at=deadline_at):
+            pass
+
+    assert exc_info.value.failure_reason == "timeout"
+    assert exc_info.value.__cause__ is not None
+    assert call_count == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stream_429_deadline_expires_during_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_client(monkeypatch)
+
+    call_count = 0
+
+    async def failing_stream(prompt: str, attempt: int) -> AsyncIterator[str]:
+        nonlocal call_count
+        call_count += 1
+        raise GeminiQuotaError("429 RESOURCE_EXHAUSTED. Please retry in 5s")
+        yield ""
+
+    client._stream_model = failing_stream
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(gemini_module.asyncio, "sleep", sleep)
+
+    deadline_at = time.perf_counter() - 0.0001
+
+    with pytest.raises(GeminiAnalysisError) as exc_info:
+        async for _ in client.stream_analyze_note("note", deadline_at=deadline_at):
+            pass
+
+    assert exc_info.value.failure_reason == "timeout"
+    assert exc_info.value.__cause__ is not None
+    assert call_count == 1
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio

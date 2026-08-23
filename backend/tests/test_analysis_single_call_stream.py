@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.dependencies import get_current_user, get_firestore_client
 from app.models.analysis import Condition, DocumentationStatus
@@ -521,3 +522,65 @@ class TestStreamRetry:
 
         assert gemini.call_count == 1
         app.dependency_overrides.clear()
+
+    def test_corrupt_exact_cache_falls_back_to_gemini_in_stream(self, valid_db, app):
+        """Corrupt cached condition data must not reach the user; the streaming
+        path must fall back to Gemini and emit a complete analysis."""
+        cached = {
+            "conditions": [{
+                "condition_name": "Diabetes",
+                "evidence_quote": "Patient has diabetes",
+                "documentation_status": "well_documented",
+                "suggested_icd10": "E11.9",
+                "confidence": 5,
+            }],
+            "gaps": [],
+            "summary": "Patient has diabetes.",
+            "model_version": "cached-model",
+            "prompt_version": "v1",
+        }
+        valid_db.get_cached_analysis_result.return_value = cached
+
+        gemini = FakeGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            complete = [data for etype, data in events if etype == "complete"]
+            assert len(complete) == 1
+            assert complete[0]["analysis"]["summary"] == "Patient has diabetes."
+
+        app.dependency_overrides.clear()
+        assert gemini.call_count == 1
+        valid_db.persist_analysis_for_note.assert_awaited_once()
+        finish_calls = valid_db.finish_analysis_job.await_args_list
+        assert any(c.kwargs.get("status") == "completed" for c in finish_calls)
+
+    def test_similar_cache_lookup_failure_falls_back_to_gemini_in_stream(self, valid_db, app):
+        """When the similar-cache Firestore lookup raises, the streaming path
+        must fall back to Gemini and complete successfully."""
+        valid_db.get_cached_analysis_result.return_value = None
+        valid_db.find_similar_cached_results.side_effect = RuntimeError(
+            "firestore unavailable"
+        )
+
+        gemini = FakeGemini()
+        app.dependency_overrides[get_current_user] = lambda: TEST_USER
+        app.dependency_overrides[get_gemini_client] = lambda: gemini
+        app.dependency_overrides[get_firestore_client] = lambda: valid_db
+
+        with TestClient(app) as c:
+            response = c.get("/notes/n1/analysis/stream")
+            events = _parse_sse(response.text)
+            complete = [data for etype, data in events if etype == "complete"]
+            assert len(complete) == 1
+            assert complete[0]["analysis"]["summary"] == "Patient has diabetes."
+
+        app.dependency_overrides.clear()
+        assert gemini.call_count == 1
+        valid_db.persist_analysis_for_note.assert_awaited_once()
+        finish_calls = valid_db.finish_analysis_job.await_args_list
+        assert any(c.kwargs.get("status") == "completed" for c in finish_calls)

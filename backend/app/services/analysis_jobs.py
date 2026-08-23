@@ -188,7 +188,7 @@ async def _analyze_and_persist(
             if similar is not None:
                 try:
                     result = _parse_cached_result(similar, note.raw_text)
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError, ValueError, ValidationError):
                     logger.exception(
                         "Corrupt similar-cache entry for note %s; ignoring", note.id
                     )
@@ -319,7 +319,7 @@ async def _get_cached_result(
 
     try:
         return _parse_cached_result(cached, note_text)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, ValidationError):
         logger.exception(
             "Corrupt analysis cache entry for key %s; ignoring", cache_key
         )
@@ -430,7 +430,15 @@ async def find_similar_cached_analysis(
     global (no user/note scoping). When no candidate passes every safety
     check, returns ``None`` so the caller can fall back to Gemini. The exact
     cache lookup is handled separately and is not performed here.
+
+    Any failure to read the similar cache is treated as a cache miss so the
+    caller can fall back to a normal (uncached) Gemini call rather than fail
+    the job.
     """
-    buckets = compute_buckets(note_text)
-    candidates = await db.find_similar_cached_results(buckets)
-    return select_best_similar_candidate(note_text, candidates, threshold)
+    try:
+        buckets = compute_buckets(note_text)
+        candidates = await db.find_similar_cached_results(buckets)
+        return select_best_similar_candidate(note_text, candidates, threshold)
+    except Exception:
+        logger.exception("Failed to read similar analysis cache; ignoring")
+        return None
