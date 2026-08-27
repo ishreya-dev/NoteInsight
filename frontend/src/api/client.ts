@@ -13,7 +13,7 @@ import type {
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL as string;
 
-const DEFAULT_TIMEOUT = 15_000;
+const DEFAULT_TIMEOUT = 45_000;
 
 export type AnalysisStreamHandlers = {
   signal?: AbortSignal;

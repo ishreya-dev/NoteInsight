@@ -568,7 +568,7 @@ async def stream_analysis(
 
         yield _sse("status", {"stage": "preparing", "message": "Preparing clinical analysis..."})
         last_status = None
-        max_polls = max(1, int(settings.analysis_timeout_seconds / 2 / 0.2))
+        max_polls = max(1, int(settings.analysis_timeout_seconds / 0.2))
         while True:
             if await request.is_disconnected():
                 log_stream_completed()
