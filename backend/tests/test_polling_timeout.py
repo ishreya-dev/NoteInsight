@@ -249,7 +249,7 @@ async def test_polling_limit_is_derived_from_settings(
     db.get_note.return_value = note
     db.get_analysis_job.return_value = _make_processing_job(note.user_id)
 
-    # 10-second analysis timeout -> max_polls = int(10/2/0.2) = 25
+    # 10-second analysis timeout -> max_polls = int(10/0.2) = 50
     settings = MagicMock(analysis_timeout_seconds=10, gemini_model="gemini-test")
 
     request = _make_connected_request(_make_request_scope(), monkeypatch)
@@ -270,20 +270,15 @@ async def test_polling_limit_is_derived_from_settings(
     except StopAsyncIteration:
         pass
 
-    # Each poll calls get_analysis_job once. With a 10s timeout the budget
-    # is 25 polls. Allow a margin because the disconnect check runs first and
-    # the timeout check runs before the read on the final iteration.
-    assert 20 <= db.get_analysis_job.await_count <= 30, (
-        f"Expected ~25 polls, got {db.get_analysis_job.await_count}"
-    )
+    assert db.get_analysis_job.await_count == 51
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timeout,expected_polls", [
     (0.39, 2),
-    (0.4, 2),
-    (0.79, 2),
-    (0.8, 3),
+    (0.4, 3),
+    (0.79, 4),
+    (0.8, 5),
 ])
 async def test_polling_boundary_clamps_min_polls(
     db: AsyncMock,
